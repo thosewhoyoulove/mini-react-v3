@@ -1,0 +1,14 @@
+{
+  "name": "mini-react",
+  "private": true,
+  "version": "0.0.0",
+  "description": "React 源码风格 monorepo 骨架",
+  "packageManager": "pnpm@9.15.4",
+  "scripts": {
+    "dev": "pnpm --filter hello-dom dev",
+    "typecheck": "tsc -b"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  }
+}

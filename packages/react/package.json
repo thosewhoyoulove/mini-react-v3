@@ -1,0 +1,25 @@
+{
+  "name": "react",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./jsx-runtime": {
+      "types": "./src/jsx.ts",
+      "default": "./src/jsx.ts"
+    },
+    "./jsx-dev-runtime": {
+      "types": "./src/jsx.ts",
+      "default": "./src/jsx.ts"
+    }
+  },
+  "dependencies": {
+    "shared": "workspace:*"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "react-dom",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./client": {
+      "types": "./src/client.ts",
+      "default": "./src/client.ts"
+    }
+  },
+  "dependencies": {
+    "react": "workspace:*",
+    "react-reconciler": "workspace:*",
+    "shared": "workspace:*"
+  }
+}

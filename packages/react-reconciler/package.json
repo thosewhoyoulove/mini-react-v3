@@ -1,0 +1,19 @@
+{
+  "name": "react-reconciler",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "dependencies": {
+    "react": "workspace:*",
+    "scheduler": "workspace:*",
+    "shared": "workspace:*"
+  }
+}
