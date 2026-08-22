@@ -23,3 +23,10 @@ export function useEffect(
 ): void {
   resolveDispatcher().useEffect(create, deps);
 }
+
+export function useLayoutEffect(
+  create: () => (() => void) | void,
+  deps?: unknown[],
+): void {
+  resolveDispatcher().useLayoutEffect(create, deps);
+}

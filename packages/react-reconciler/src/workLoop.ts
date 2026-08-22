@@ -40,7 +40,9 @@ import { setScheduleUpdateOnFiber } from './scheduleUpdate';
  *    只打 flags，不碰真实 DOM。
  *
  * 2. Commit 阶段（不可中断）
- *    整棵树走完后，commitRoot 按 flags 改 DOM，再跑 useEffect。
+ *    commitRoot：Before Mutation（教学版空）→ Mutation 改 DOM / layout destroy
+ *    → 切换 current → Layout 跑 useLayoutEffect create
+ *    → 绘制后再跑 useEffect（Scheduler 宏任务）。
  *
  * Lane 决定走哪条路（对齐官方 scheduleUpdateOnFiber / ensureRootIsScheduled）：
  *   SyncLane    → queueMicrotask → workLoopSync（不 shouldYield）
@@ -202,7 +204,7 @@ function markRootFinished(root: FiberRoot, renderedLanes: Lanes): void {
 }
 
 /**
- * WIP 整棵走完 → commit 改 DOM。
+ * WIP 整棵走完 → commitRoot（Mutation / Layout，Passive 延后到绘制后）。
  * 最后再 ensureRootIsScheduled：pendingLanes 里若还留着更低优（Default），接着约。
  */
 function finishRoot(root: FiberRoot, renderedLanes: Lanes): void {

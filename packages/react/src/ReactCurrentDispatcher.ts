@@ -5,6 +5,10 @@ export interface Dispatcher {
     initialState: S | (() => S),
   ) => [S, Dispatch<S | ((prev: S) => S)>];
   useEffect: (create: () => (() => void) | void, deps?: unknown[]) => void;
+  useLayoutEffect: (
+    create: () => (() => void) | void,
+    deps?: unknown[],
+  ) => void;
 }
 
 export const ReactCurrentDispatcher: {

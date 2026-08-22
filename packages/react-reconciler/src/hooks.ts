@@ -1,6 +1,6 @@
 import type { Dispatcher } from 'react';
 import { ReactCurrentDispatcher } from 'react';
-import { Passive } from './fiberFlags';
+import { Passive, Update as UpdateFlag } from './fiberFlags';
 import type { Fiber } from './fiber';
 import { DefaultLane } from './fiberLanes';
 import { scheduleUpdateOnFiber } from './scheduleUpdate';
@@ -13,6 +13,10 @@ import { scheduleUpdateOnFiber } from './scheduleUpdate';
  * 组件里第几次调用 useXxx，就对应第几格。没有名字，所以不能写在 if 里。
  *
  * 首次渲染走 mount*（往后接新格）；更新走 update*（顺着 current 链表克隆到 wip）。
+ *
+ * useEffect / useLayoutEffect 共用 Hook 链表，靠 tag 的 bit 区分：
+ *   HookHasEffect | HookLayout  → Layout 阶段（DOM 已改、尚未绘制）
+ *   HookHasEffect | HookPassive → Passive 阶段（绘制后的宏任务）
  */
 
 type Update<S> = {
@@ -57,7 +61,10 @@ type Hook = {
 };
 
 type Effect = {
-  /** 是否本轮要跑。HookHasEffect = 要执行 create；0 = deps 没变，跳过。 */
+  /**
+   * HookHasEffect | HookLayout | HookPassive。
+   * deps 没变时只保留 Layout/Passive，不带 HookHasEffect，commit 用 mask 过滤。
+   */
   tag: number;
 
   /** commit 阶段调用的副作用函数，返回值当作 destroy。 */
@@ -70,7 +77,14 @@ type Effect = {
   deps: unknown[] | undefined;
 };
 
-const HookHasEffect = 1;
+/** 本轮要执行 create / destroy。deps 没变就不带这一位。 */
+export const HookHasEffect = 0b001;
+
+/** useLayoutEffect。Mutation 里跑 destroy，Layout 里跑 create。 */
+export const HookLayout = 0b010;
+
+/** useEffect。绘制后的 Passive 阶段跑 destroy → create。 */
+export const HookPassive = 0b100;
 
 function isEffect(value: unknown): value is Effect {
   return (
@@ -116,7 +130,7 @@ function areHookInputsEqual(
  *   1. new 一个空 Hook（next 还是 null）
  *   2. 这是本组件第一个 Hook → 写成 Fiber.memoizedState（链表头），游标也指过去
  *   3. 前面已经有 Hook → 接到当前游标的 next，再把游标挪到新节点
- *   4. 返回当前这格，给 useState / useEffect 往 memoizedState 里填数据
+ *   4. 返回当前这格，给 useState / useEffect / useLayoutEffect 往 memoizedState 里填数据
  *
  * 组件里每调一次 Hook，这里就往后接一格。顺序必须固定，下次更新才对得上。
  */
@@ -135,7 +149,7 @@ function mountWorkInProgressHook(): Hook {
     workInProgressHook.next = hook; // 3. 上一格的 next 接到新 Hook
     workInProgressHook = hook; // 游标挪到新 Hook
   }
-  return workInProgressHook; // 4. 把这一格交给 mountState / mountEffect 去填
+  return workInProgressHook; // 4. 把这一格交给 mountState / mountEffectImpl 去填
 }
 
 /**
@@ -145,7 +159,7 @@ function mountWorkInProgressHook(): Hook {
  *   1. 取 current 上的下一格：第一次从 Fiber.memoizedState 取头，之后走 currentHook.next
  *   2. current 上没有下一格 → 这次 Hook 调用比上次多，直接抛错
  *   3. 克隆一格到 wip（复用 queue，next 先空着），接到 wip 链表尾
- *   4. 返回这格克隆，给 updateState / updateEffect 在上面算新值
+ *   4. 返回这格克隆，给 updateState / updateEffectImpl 在上面算新值
  *
  * 两棵树各一条链表：current 只读对齐，wip 才是本轮要 commit 的。
  */
@@ -179,7 +193,7 @@ function updateWorkInProgressHook(): Hook {
     workInProgressHook.next = newHook; // 接到 wip 上一格的 next
     workInProgressHook = newHook;
   }
-  return workInProgressHook; // 4. 把这格克隆交给 updateState / updateEffect
+  return workInProgressHook; // 4. 把这格克隆交给 updateState / updateEffectImpl
 }
 
 function dispatchSetState(
@@ -272,52 +286,102 @@ function updateState<S>(
   return [hook.memoizedState as S, queue.dispatch!];
 }
 
-function mountEffect(
+/**
+ * 首次渲染：往当前 Hook 格写入一个 effect，并在 Fiber 上打对应 flags。
+ *
+ * 只做三步：
+ *   1. 追加一格空 Hook
+ *   2. Fiber.flags 或上 fiberFlags（Passive = useEffect，UpdateFlag = useLayoutEffect）
+ *   3. memoizedState 写成 Effect，tag = hookFlags | HookHasEffect（本轮一定跑）
+ */
+function mountEffectImpl(
+  fiberFlags: number,
+  hookFlags: number,
   create: () => (() => void) | void,
   deps: unknown[] | undefined,
 ): void {
-  const hook = mountWorkInProgressHook();
-  currentlyRenderingFiber!.flags |= Passive;
+  const hook = mountWorkInProgressHook(); // 1
+  currentlyRenderingFiber!.flags |= fiberFlags; // 2
   hook.memoizedState = {
-    tag: HookHasEffect,
+    tag: hookFlags | HookHasEffect,
     create,
     destroy: undefined,
     deps,
-  } satisfies Effect;
+  } satisfies Effect; // 3
 }
 
-function updateEffect(
+/**
+ * 更新：deps 没变就只保留类型位；变了才打 Fiber flags，并带上 HookHasEffect。
+ *
+ * 只做三步：
+ *   1. 取出对应当前这一格的 wip Hook，读出上一轮 Effect
+ *   2. deps 逐项 Object.is 都相同 → tag 只留 hookFlags，destroy 接着用，不打 Fiber flags
+ *   3. deps 变了 → Fiber 打 flags，tag 带上 HookHasEffect，commit 才会跑 destroy / create
+ */
+function updateEffectImpl(
+  fiberFlags: number,
+  hookFlags: number,
   create: () => (() => void) | void,
   deps: unknown[] | undefined,
 ): void {
   const hook = updateWorkInProgressHook();
-  const prev = hook.memoizedState as Effect;
+  const prev = hook.memoizedState as Effect; // 1
   if (areHookInputsEqual(deps, prev.deps)) {
     hook.memoizedState = {
-      tag: 0,
+      tag: hookFlags,
       create,
       destroy: prev.destroy,
       deps,
-    } satisfies Effect;
+    } satisfies Effect; // 2. 类型还在，没有 HookHasEffect；卸载时仍能按 Layout/Passive 找到 destroy
     return;
   }
-  currentlyRenderingFiber!.flags |= Passive;
+  currentlyRenderingFiber!.flags |= fiberFlags; // 3
   hook.memoizedState = {
-    tag: HookHasEffect,
+    tag: hookFlags | HookHasEffect,
     create,
     destroy: prev.destroy,
     deps,
   } satisfies Effect;
 }
 
+function mountEffect(
+  create: () => (() => void) | void,
+  deps: unknown[] | undefined,
+): void {
+  mountEffectImpl(Passive, HookPassive, create, deps);
+}
+
+function updateEffect(
+  create: () => (() => void) | void,
+  deps: unknown[] | undefined,
+): void {
+  updateEffectImpl(Passive, HookPassive, create, deps);
+}
+
+function mountLayoutEffect(
+  create: () => (() => void) | void,
+  deps: unknown[] | undefined,
+): void {
+  mountEffectImpl(UpdateFlag, HookLayout, create, deps);
+}
+
+function updateLayoutEffect(
+  create: () => (() => void) | void,
+  deps: unknown[] | undefined,
+): void {
+  updateEffectImpl(UpdateFlag, HookLayout, create, deps);
+}
+
 const HooksDispatcherOnMount: Dispatcher = {
   useState: mountState as Dispatcher['useState'],
   useEffect: mountEffect,
+  useLayoutEffect: mountLayoutEffect,
 };
 
 const HooksDispatcherOnUpdate: Dispatcher = {
   useState: updateState as Dispatcher['useState'],
   useEffect: updateEffect,
+  useLayoutEffect: updateLayoutEffect,
 };
 
 /**
@@ -326,7 +390,7 @@ const HooksDispatcherOnUpdate: Dispatcher = {
  * 只做四步：
  *   1. 清空 wip.memoizedState 和两个游标，准备重新建链表
  *   2. 没有 current 链表 → mount dispatcher；有 → update dispatcher
- *   3. 真正跑 Component(props)，里面的 useState / useEffect 会调到上面两个函数
+ *   3. 真正跑 Component(props)，里面的 useState / useEffect / useLayoutEffect 会调到 dispatcher
  *   4. 清掉模块级指针，返回 children 给 reconcile
  */
 export function renderWithHooks(
@@ -346,7 +410,7 @@ export function renderWithHooks(
       ? HooksDispatcherOnMount // 2. 第一次：往后接新格
       : HooksDispatcherOnUpdate; // 2. 有 current 链表：按顺序克隆对齐
 
-  const children = Component(props); // 3. 这里才会真正调到 useState / useEffect
+  const children = Component(props); // 3. 这里才会真正调到 useState / useEffect / useLayoutEffect
 
   ReactCurrentDispatcher.current = null;
   currentlyRenderingFiber = null;
@@ -355,33 +419,57 @@ export function renderWithHooks(
   return children;
 }
 
+/**
+ * 顺着函数组件的 Hook 链表，跑匹配 hookFlags 的 destroy。
+ *
+ * 只做三步：
+ *   1. 从 Fiber.memoizedState 走到下一格
+ *   2. 这一格是 Effect，且 (tag & hookFlags) === hookFlags 才处理
+ *   3. 有 destroy 就调用，然后清掉，避免重复跑
+ *
+ * 更新时 hookFlags 带 HookHasEffect（deps 变了才清）；
+ * 卸载时只传 HookLayout / HookPassive，deps 没变的也要清。
+ */
 export function commitHookEffectListUnmount(
   fiber: Fiber,
-  force: boolean,
+  hookFlags: number,
 ): void {
-  let hook: Hook | null = fiber.memoizedState;
+  let hook: Hook | null = fiber.memoizedState; // 1
   while (hook != null) {
     const value = hook.memoizedState;
-    if (isEffect(value) && typeof value.destroy === 'function') {
-      if (force || (value.tag & HookHasEffect) !== 0) {
-        value.destroy();
-        value.destroy = undefined;
-      }
+    if (
+      isEffect(value) &&
+      (value.tag & hookFlags) === hookFlags && // 2
+      typeof value.destroy === 'function'
+    ) {
+      value.destroy(); // 3
+      value.destroy = undefined;
     }
     hook = hook.next;
   }
 }
 
-export function commitHookEffectListMount(fiber: Fiber): void {
-  let hook: Hook | null = fiber.memoizedState;
+/**
+ * 顺着函数组件的 Hook 链表，跑匹配 hookFlags 的 create，返回值存成 destroy。
+ *
+ * 只做三步：
+ *   1. 从 Fiber.memoizedState 走到下一格
+ *   2. 这一格是 Effect，且 (tag & hookFlags) === hookFlags 才处理
+ *   3. 调 create，函数返回值记下，下次 unmount / deps 变化时当 destroy
+ */
+export function commitHookEffectListMount(
+  fiber: Fiber,
+  hookFlags: number,
+): void {
+  let hook: Hook | null = fiber.memoizedState; // 1
   while (hook != null) {
     const value = hook.memoizedState;
     if (
       isEffect(value) &&
       typeof value.create === 'function' &&
-      (value.tag & HookHasEffect) !== 0
+      (value.tag & hookFlags) === hookFlags // 2
     ) {
-      const destroy = value.create();
+      const destroy = value.create(); // 3
       value.destroy = typeof destroy === 'function' ? destroy : undefined;
     }
     hook = hook.next;

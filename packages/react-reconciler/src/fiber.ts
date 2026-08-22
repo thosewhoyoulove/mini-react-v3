@@ -71,13 +71,13 @@ export interface Fiber {
   memoizedProps: any;
   /**
    * 组件记住的状态。
-   * 函数组件：hooks 链表的头节点（useState / useEffect）
+   * 函数组件：hooks 链表的头节点（useState / useEffect / useLayoutEffect）
    * HostRoot：一般不用
    */
   memoizedState: any;
   /** 待处理更新队列。本项目里主要给 HostRoot / 函数组件挂 update */
   updateQueue: any;
-  /** 这个节点自己的副作用：Placement / Update / ChildDeletion / Passive */
+  /** 这个节点自己的副作用：Placement / Update（含 useLayoutEffect）/ ChildDeletion / Passive */
   flags: number;
   /** 子树里有没有副作用。commit 时子树全是 NoFlags 就可以整棵跳过 */
   subtreeFlags: number;
