@@ -2,7 +2,7 @@
 
 [← 返回总目录](../../React设计与实现.md) · [上一章](./09-beginWork按tag分发.md) · [下一章 →](./11-completeWork.md)
 
-> 主文件：`packages/react-reconciler/src/childFiber.ts`  
+> 主文件：`packages/react-reconciler/src/childFiber.ts`
 > `beginWork` 调 `reconcileChildren`；本章讲「新 children 怎么对成一条 Fiber sibling 链表，副作用只打 flags」。
 
 声明式更新的核心成本，不在「再跑一遍组件函数」，而在「新旧两棵描述怎么对齐」。本章对着 `childFiber.ts`，把单节点与列表两条路径讲透：谁复用、谁新建、谁删除、列表里何时打 `Placement`（移动）。
@@ -13,6 +13,7 @@
 - [10.2 单文本 / 单元素](#102-单文本--单元素)
 - [10.3 数组子节点](#103-数组子节点)
 - [10.4 `lastPlacedIndex`](#104-lastplacedindex)
+- [面试复习](#面试复习)
 
 ---
 
@@ -71,12 +72,28 @@ export const mountChildFibers = ChildReconciler(false);
 
 | | `mountChildFibers`（false） | `reconcileChildFibers`（true） |
 | --- | --- | --- |
-| 何时 | `current == null`，首次挂载 | 已有 current，更新 |
+| 何时 | 当前正在处理的 Fiber 没有 current | 当前正在处理的 Fiber 已有 current |
 | 旧孩子 | 传 `null` | `current.child` |
 | 副作用 | **不打** Placement / deletions | 要打，Commit 才能改对 DOM |
-| 为什么 | 还没有上屏的 DOM；整棵树稍后由 `completeWork` 一次性挂上 | 必须精确记下「插 / 移 / 删」 |
+| 为什么 | 这是刚新建 Fiber 的后代，可随宿主子树一起组装 | 必须精确记下「插 / 移 / 删」 |
 
-`deleteChild`、`placeChild`、`placeSingleChild` 里都先看 `shouldTrackSideEffects`：mount 路径直接 return，避免无意义的删除记录，也避免首次插入被当成「每个节点各插一次」。
+`deleteChild`、`placeChild`、`placeSingleChild` 里都先看 `shouldTrackSideEffects`：mount 路径直接 return，避免无意义的删除记录，也避免新建子树内部每个后代都各打一遍插入标记。
+
+### 首次 HostRoot 是关键例外
+
+`reconcileChildren` 判断的是 `current == null`，不是 `current.child == null`。首次 `root.render` 时，HostRoot WIP 是由 current HostRoot 经 `createWorkInProgress` 产生的，因此 HostRoot 有 current：
+
+```text
+HostRoot：current != null，current.child == null
+  → reconcileChildFibers(true)
+  → 新建 App，并给 App 打 Placement
+
+App：current == null
+  → mountChildFibers(false)
+  → 新建 App 的后代，不逐个打 Placement
+```
+
+所以 `mountChildFibers` 不能简单等同于「整个首次渲染」。它描述的是：**当前这个父 Fiber 本身也是新建的，没有旧 Fiber 可对照**。
 
 总入口 `reconcileChildFibers`（工厂返回的那个函数）按**新 children 的形态**分派：
 
@@ -216,7 +233,7 @@ null / false …   → 旧孩子全删，返回 null
    - `oldIndex < lastPlacedIndex` → 相对已经放过的节点**前移**，打 `Placement`，`lastPlacedIndex` 不变；
    - 否则相对位置没乱，**就地留下**，`lastPlacedIndex = oldIndex`。
 3. 没有 `current`（新建）→ 打 `Placement`，`lastPlacedIndex` 不变。
-4. mount 路径不打 Placement，`lastPlacedIndex` 原样返回。
+4. mount 路径不打 Placement，`lastPlacedIndex` 原样返回。首次 HostRoot 不是这条路径；它新建的首个应用 Fiber仍会打 `Placement`。
 
 ### 例子：旧 `[A, B, C]` → 新 `[A, C, B]`
 
@@ -251,7 +268,7 @@ C 就地留下当锚点；B、A 相对它都要前移，打 Placement。Commit �
 ## 小结
 
 1. **Diff 发生在 Render**：对成 wip 的 child 链表，只打 `Placement` / `ChildDeletion`，不改 DOM。
-2. **mount / update 同一套算法**：`ChildReconciler(false/true)`，差别只在是否跟踪副作用。
+2. **mount / update 同一套算法**：`ChildReconciler(false/true)`，差别只在是否跟踪副作用；分叉条件是当前 Fiber 有无 current。
 3. **单节点**：沿旧链找 **key + type**；命中则复用并删掉其余。
 4. **数组**：先按下标试探，对不上再 **Map(key|index)**；剩余旧节点删除。
 5. **`lastPlacedIndex`**：决定复用节点是「就地留下」还是「相对前移」；这是列表移动的最小信息。
@@ -259,5 +276,39 @@ C 就地留下当锚点；B、A 相对它都要前移，打 Placement。Commit �
 写业务时记住一句：**稳定的 key 负责认人，Diff 负责算位置。** 下一章 `completeWork` 会在这棵打好 flags 的树上创建宿主实例，并把副作用向上冒泡，供 Commit 扫一遍落地。
 
 ---
+
+## 面试复习
+
+### 一句话结论
+
+子节点 Diff 用 key 和 type 决定复用，用 `lastPlacedIndex` 决定移动，并通过 `ChildReconciler(false/true)` 控制是否记录副作用。
+
+### 面试回答（可口述，为什么→机制→仓库落点→官方差异）
+
+为什么需要子节点 Diff：声明式更新只给新 children，React 必须把它和旧 sibling 链对齐，才能复用状态与 DOM。机制上，单节点按 key + type 查找；数组先按位置试探，失配后把剩余旧节点放进 Map，再用 key 或 index 匹配；新建和相对前移打 `Placement`，删除记到父 Fiber。仓库落点是 `childFiber.ts`。教学版保留了核心启发式，但没有 Fragment、Portal、迭代器、开发态 key 警告等官方分支。
+
+### 常见追问
+
+**Q：为什么 key 相同还要比较 type？**
+A：key 只标识列表身份；`div` 变成 `span` 时宿主实例类型不同，不能复用。
+
+**Q：`lastPlacedIndex` 判断的是绝对位置吗？**
+A：不是。它记录已确认可就地保留节点中的最大旧下标，用来判断后续复用节点是否发生相对移动。
+
+**Q：首次渲染是否完全没有 `Placement`？**
+A：否。首次 HostRoot 有 current，根层走 `reconcileChildFibers`，新建的首个应用 Fiber会打 `Placement`；其新建后代才走不跟踪副作用的 mount 路径。
+
+### 容易说错
+
+- 错：没写 key 就无法复用。对：会退化为按 index 匹配，但插入、重排容易状态错位。
+- 错：数组 Diff 做全局最优移动。对：这是 O(n) 启发式，以稳定 key 和从左到右扫描为前提。
+- 错：mount/update 由 `current.child` 是否为空决定。对：由当前 Fiber 的 `current` 是否为空决定。
+
+### 源码入口
+
+- `packages/react-reconciler/src/childFiber.ts`：`ChildReconciler`
+- `packages/react-reconciler/src/childFiber.ts`：`reconcileChildrenArray`
+- `packages/react-reconciler/src/childFiber.ts`：`placeChild`、`placeSingleChild`
+- `packages/react-reconciler/src/beginWork.ts`：`reconcileChildren` 的调用点
 
 [← 返回总目录](../../React设计与实现.md) · [上一章](./09-beginWork按tag分发.md) · [下一章 →](./11-completeWork.md)
