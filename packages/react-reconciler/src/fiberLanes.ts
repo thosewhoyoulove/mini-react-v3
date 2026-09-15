@@ -11,12 +11,22 @@
  * 官方还有 InputContinuous、Transition、Idle 等十几条；读源码时把它们
  * 都当成「Default 和 Sync 之间的不同档位」即可。
  */
+/** 单条更新优先级，占一个 bit。 */
 export type Lane = number;
+
+/** 零条或多条 Lane 按位或后的集合。 */
 export type Lanes = number;
 
+/** 没有单条 Lane。 */
 export const NoLane: Lane = 0b00;
+
+/** Lane 集合为空。 */
 export const NoLanes: Lanes = 0b00;
+
+/** 最高优：root.render 使用微任务中的同步工作循环。 */
 export const SyncLane: Lane = 0b01;
+
+/** 普通优先级：用户 setState 交给 Scheduler 做可切片工作。 */
 export const DefaultLane: Lane = 0b10;
 
 /**

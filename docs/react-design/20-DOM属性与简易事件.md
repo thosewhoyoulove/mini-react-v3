@@ -74,7 +74,7 @@ demo 按钮的 `onClick={() => setCount(v => v + 1)}` 每次 Render 都是新函
 | 名称 | `onClick` → `click` | 另有 `onChange` 等特殊映射 |
 | 冒泡 | 浏览器默认 | 沿 Fiber 树模拟 |
 
-够支撑 demo 的 `+1` / `add` / `reverse`。被问到合成事件时，承认未实现即可（附录 C）。不要在 host config 里半套委托——那会和「简易 onXxx」这条讲解线缠在一起。
+够支撑 demo 中 State、Keyed Diff、Effect 三组按钮。被问到合成事件时，承认未实现即可（附录 C）。不要在 host config 里半套委托——那会和「简易 onXxx」这条讲解线缠在一起。
 
 下一章把应用入口收束：`createRoot` 如何建出 HostRoot，`render` 如何走进同一套工作循环。
 

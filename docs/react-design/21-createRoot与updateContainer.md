@@ -115,14 +115,13 @@ App.beginWork
 createRoot(#root)
   → createElement(App, null)
   → updateContainer + SyncLane
-  → App() 跑起来，useState(0) mount
+  → App() 跑起来，StateDemo 的 useState(0) mount
   → 文本「count: 0」上屏
 点 +1
   → setCount → DefaultLane
-  → App() 再跑，updateState 得到 1
+  → StateDemo() 再跑，updateState 得到 1
   → 文本 Fiber 复用，打 Update
   → commitTextUpdate
-  → useEffect 宏任务改 document.title
 ```
 
 未实现的能力（Fragment、合成事件、完整 Lane…）见附录 C。能把这条路径对着源码走通，教学版的目标就达到了。

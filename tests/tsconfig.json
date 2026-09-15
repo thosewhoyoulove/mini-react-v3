@@ -1,0 +1,17 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": "..",
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "noEmit": true,
+    "paths": {
+      "react": ["packages/react/src/index.ts"],
+      "react-reconciler": ["packages/react-reconciler/src/index.ts"],
+      "scheduler": ["packages/scheduler/src/index.ts"],
+      "shared": ["packages/shared/src/index.ts"]
+    }
+  },
+  "include": ["run.ts"]
+}

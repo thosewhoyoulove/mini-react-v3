@@ -77,8 +77,11 @@ Commit 先做 Mutation，再把 `root.current` 切到 finishedWork，然后执�
 
 ## 演示时怎么说
 
-- 点 `+1`：“update 入 Hook 环形队列 → 标 `DefaultLane` → Render 重跑组件并复用 HostText → Commit 更新文本 → Passive Effect 后续执行。”
+- 点 `+1`：“update 入 Hook 环形队列 → 标 `DefaultLane` → Render 重跑 StateDemo 并复用 HostText → Commit 更新文本。”
+- 点 `+3（函数式）`：“三条 action 进入同一个环形队列，同档调度只约一次，updateState 从最老的一条开始归约。”
 - 点 `reverse`：“稳定 key 让旧 Fiber 和 DOM 被找回；`lastPlacedIndex` 判断哪些节点需要 `Placement` 移动。”
 - 点 `add`：“新 key 没有旧 Fiber，Render 创建离屏实例并打 `Placement`，Commit 插入。”
+- 点 `remove first`：“父 Fiber 记录 deletions 和 ChildDeletion，Mutation 先清 Effect 再删除宿主节点。”
+- 点 `next value`：“Layout cleanup/create 在同步 Commit，Passive cleanup/create 在后续 Scheduler 任务；页面日志可直接对照顺序。”
 
-demo 的完整验证路径见[附录](./docs/react-design/appendix.md#用-demo-验证)。
+demo 的完整验证路径见[附录](./docs/react-design/appendix.md#用-demo-验证)，相同行为也可用 `pnpm test` 自动验证。

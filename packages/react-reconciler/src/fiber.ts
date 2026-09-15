@@ -20,10 +20,13 @@ import { NoLanes } from './fiberLanes';
  *   HostRoot
  *     │ child
  *     ▼
- *   div ──sibling──► p
- *     │ child          │ child
- *     ▼                ▼
- *   h1 ──child──► "Mini React"     "count: 0"
+ *   div
+ *     │ child
+ *     ▼
+ *   h1 ──sibling──► p
+ *     │ child        │ child
+ *     ▼              ▼
+ *   "Mini React"  "count: 0"
  *
  * 从 div 出发：fiber.child 是 h1，h1.sibling 是 p，p.return 回到 div。
  */

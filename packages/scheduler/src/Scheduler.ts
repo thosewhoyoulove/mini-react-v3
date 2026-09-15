@@ -14,16 +14,30 @@ import { enableSchedulerDebugging } from 'shared';
  * SyncLane 根本不会走进这个文件，它走 queueMicrotask。
  */
 
+/** Scheduler API 接受的五档优先级；教学版暂不按档位排序队列。 */
 export type PriorityLevel = 1 | 2 | 3 | 4 | 5;
 
+/** 预留的最高 Scheduler 优先级；当前 reconciler 的 SyncLane 不经过 Scheduler。 */
 export const ImmediatePriority: PriorityLevel = 1;
+
+/** 连续输入优先级占位；教学版队列尚不按它排序。 */
 export const UserBlockingPriority: PriorityLevel = 2;
+
+/** DefaultLane 使用的普通优先级。 */
 export const NormalPriority: PriorityLevel = 3;
+
+/** 低优先级占位；教学版队列尚不按它排序。 */
 export const LowPriority: PriorityLevel = 4;
+
+/** 空闲优先级占位；教学版队列尚不按它排序。 */
 export const IdlePriority: PriorityLevel = 5;
 
+/** Scheduler 队列中的一项工作。 */
 type Task = {
+  /** 单调递增任务号，reconciler 用它取消尚未开始的回调。 */
   id: number;
+
+  /** null 表示任务已执行或已取消，出队时直接跳过。 */
   callback: (() => void) | null;
 };
 
@@ -32,6 +46,8 @@ const yieldInterval = 5;
 
 /** 当前切片的截止时间。shouldYield 拿它和 performance.now() 比较。 */
 let deadline = 0;
+
+/** 下一条任务的 id。 */
 let nextTaskId = 1;
 
 /**
@@ -43,8 +59,13 @@ let nextTaskId = 1;
  *
  * 两个 port 是一对管道：往 port2 发消息，port1 的 onmessage 就会被触发。
  */
+/** 宏任务通道；接收端每次只消费一条 callback。 */
 const channel = new MessageChannel();
+
+/** 发送端：postMessage 只负责约一个新的宏任务。 */
 const port = channel.port2;
+
+/** 等待 MessageChannel 消费的 FIFO 队列。 */
 const taskQueue: Task[] = [];
 
 channel.port1.onmessage = () => {

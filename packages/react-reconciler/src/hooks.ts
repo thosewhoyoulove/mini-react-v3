@@ -19,6 +19,7 @@ import { scheduleUpdateOnFiber } from './scheduleUpdate';
  *   HookHasEffect | HookPassive → Passive 阶段（绘制后的宏任务）
  */
 
+/** useState 的一条待处理更新。 */
 type Update<S> = {
   /** 这次更新要应用的值，或 (prev) => next 函数 */
   action: S | ((prev: S) => S);
@@ -31,6 +32,7 @@ type Update<S> = {
   next: Update<S>;
 };
 
+/** dispatch 与 Render 之间共享的环形 pending 队列。 */
 type UpdateQueue<S> = {
   /** 还没进 render 的更新。pending 指向最后插入的那条，整条是环形链表。 */
   pending: Update<S> | null;
@@ -39,18 +41,15 @@ type UpdateQueue<S> = {
   dispatch: ((action: S | ((prev: S) => S)) => void) | null;
 };
 
+/** 函数组件 Fiber.memoizedState 链表中的一格。 */
 type Hook = {
   /** 当前渲染使用的最终 state 值 */
   memoizedState: any;
 
   /**
-   * 基准状态：当存在低优先级 Update 被跳过（Skipped）时，
-   * baseState 记录的是被跳过的那个 Update 之前的基础状态。
-   * 下一次重新计算（Rebase）时，会从这个 baseState 开始重新推演。
+   * 从 queue.pending 合并进来的 Update 环形链表。
+   * 教学版 Update 没有 Lane，当前 render 会全部消费，因此不实现 baseState rebase。
    */
-  // baseState: any; 暂时丢弃
-
-  /** 已从 queue.pending 截断移过来的 Update 链表（单向） */
   baseQueue: Update<any> | null;
 
   /** 接收新更新的队列 */
@@ -60,6 +59,7 @@ type Hook = {
   next: Hook | null;
 };
 
+/** useEffect / useLayoutEffect 存在 Hook.memoizedState 中的数据。 */
 type Effect = {
   /**
    * HookHasEffect | HookLayout | HookPassive。
@@ -86,6 +86,7 @@ export const HookLayout = 0b010;
 /** useEffect。绘制后的 Passive 阶段跑 destroy → create。 */
 export const HookPassive = 0b100;
 
+/** 区分 Effect 与 useState 保存的普通状态值。 */
 function isEffect(value: unknown): value is Effect {
   return (
     typeof value === 'object' &&
@@ -105,6 +106,7 @@ let workInProgressHook: Hook | null = null;
 /** current 链表上「正在对齐的那一格」。下一个 Hook 从它的 next 取。 */
 let currentHook: Hook | null = null;
 
+/** 按 React 的规则用 Object.is 逐项比较依赖数组。 */
 function areHookInputsEqual(
   nextDeps: unknown[] | undefined,
   prevDeps: unknown[] | undefined,
@@ -196,6 +198,15 @@ function updateWorkInProgressHook(): Hook {
   return workInProgressHook; // 4. 把这格克隆交给 updateState / updateEffectImpl
 }
 
+/**
+ * setState 的稳定闭包最终进入这里。
+ *
+ * 只做四步：
+ *   1. 把 action 包成一条 Update
+ *   2. 插进 queue.pending 环形链表的尾部
+ *   3. pending 始终指向最新尾节点，pending.next 因而是最老节点
+ *   4. 给闭包捕获的 Fiber 标 DefaultLane 并发起调度
+ */
 function dispatchSetState(
   fiber: Fiber,
   queue: UpdateQueue<any>,
@@ -204,41 +215,50 @@ function dispatchSetState(
   const update = {
     action,
     next: null as unknown as Update<any>,
-  };
+  }; // 1. next 会在接环时补上
   const pending = queue.pending;
   if (pending == null) {
-    update.next = update;
+    update.next = update; // 2. 第一条自己首尾相接
   } else {
-    update.next = pending.next;
-    pending.next = update;
+    update.next = pending.next; // 2. 新尾先指向旧头
+    pending.next = update; // 2. 旧尾再接到新尾
   }
-  queue.pending = update;
-  // 用户 setState 走 DefaultLane：可切片。root.render 才是 SyncLane。
-  scheduleUpdateOnFiber(fiber, DefaultLane);
+  queue.pending = update; // 3. pending 指针挪到新尾
+  scheduleUpdateOnFiber(fiber, DefaultLane); // 4. 用户 setState 可切片；root.render 才走 SyncLane
 }
 
+/**
+ * 首次 useState：创建 Hook 状态与共享队列。
+ *
+ * 只做四步：
+ *   1. 往 wip Hook 链表追加一格
+ *   2. 惰性 initialState 只在 mount 调用一次，结果写入 memoizedState
+ *   3. 创建 pending 队列和稳定 dispatch，闭包捕获 Fiber 与 queue
+ *   4. 返回本轮状态与 dispatch
+ */
 function mountState<S>(
   initialState: S | (() => S),
 ): [S, (action: S | ((prev: S) => S)) => void] {
-  const hook = mountWorkInProgressHook();
+  const hook = mountWorkInProgressHook(); // 1
   const memoizedState =
     typeof initialState === 'function'
       ? (initialState as () => S)()
       : initialState;
-  hook.memoizedState = memoizedState;
+  hook.memoizedState = memoizedState; // 2
   const queue: UpdateQueue<S> = {
     pending: null,
     dispatch: null,
   };
-  hook.queue = queue;
+  hook.queue = queue; // 3. current / wip 之后都会复用同一个 queue
   const fiber = currentlyRenderingFiber!;
   const dispatch = ((action: S | ((prev: S) => S)) => {
     dispatchSetState(fiber, queue, action);
   }) as (action: S | ((prev: S) => S)) => void;
-  queue.dispatch = dispatch;
-  return [hook.memoizedState, dispatch];
+  queue.dispatch = dispatch; // 3. dispatch 身份在更新之间保持稳定
+  return [hook.memoizedState, dispatch]; // 4
 }
 
+/** 把 render 遗留的 baseQueue 与刚入队的 pending 两个环拼成一个环，返回新尾。 */
 function mergeCircularQueues<S>(baseQueue: Update<S>, pending: Update<S>): Update<S> {
   const baseFirst = baseQueue.next;
   const pendingFirst = pending.next;
@@ -247,10 +267,22 @@ function mergeCircularQueues<S>(baseQueue: Update<S>, pending: Update<S>): Updat
   return pending;
 }
 
+/**
+ * 更新 useState：克隆对应 Hook，再按入队顺序重放 action。
+ *
+ * 只做五步：
+ *   1. 从 current Hook 链表对齐并克隆这一格
+ *   2. 把 render 期间新来的 pending 合并进 baseQueue，并写回 current 供中断重启
+ *   3. 从最老的 baseQueue.next 开始，以 current.memoizedState 为初值重放
+ *   4. 写下最终 state 并清空已消费 baseQueue
+ *   5. 没有更新则直接返回克隆值；两条路径都复用原 dispatch
+ *
+ * 教学边界：Update 本身没有 Lane，所以本轮不会跳过低优 action，也没有 baseState rebase。
+ */
 function updateState<S>(
   _initialState: S | (() => S),
 ): [S, (action: S | ((prev: S) => S)) => void] {
-  const hook = updateWorkInProgressHook();
+  const hook = updateWorkInProgressHook(); // 1
   const queue = hook.queue as UpdateQueue<S>;
   const pending = queue.pending;
   let baseQueue = currentHook!.baseQueue as Update<S> | null;
@@ -261,14 +293,13 @@ function updateState<S>(
     } else {
       baseQueue = pending;
     }
-    // 写回 current：这次 render 如果被切片重启丢掉，下次还能从这里重放。
-    currentHook!.baseQueue = baseQueue;
-    queue.pending = null;
+    currentHook!.baseQueue = baseQueue; // 2. render 若被丢弃，下轮仍能重新取到
+    queue.pending = null; // 2. 新更新已移交给 baseQueue
   }
 
   if (baseQueue != null) {
     const first = baseQueue.next;
-    let newState = currentHook!.memoizedState as S;
+    let newState = currentHook!.memoizedState as S; // 3. 从上次成功提交的 state 开始
     let update = first;
     do {
       const action = update.action;
@@ -278,12 +309,12 @@ function updateState<S>(
           : action;
       update = update.next;
     } while (update !== first);
-    hook.memoizedState = newState;
-    hook.baseQueue = null;
-    return [newState, queue.dispatch!];
+    hook.memoizedState = newState; // 4
+    hook.baseQueue = null; // 4. 教学版全量消费，没有跳过项要保留
+    return [newState, queue.dispatch!]; // 4
   }
 
-  return [hook.memoizedState as S, queue.dispatch!];
+  return [hook.memoizedState as S, queue.dispatch!]; // 5
 }
 
 /**
@@ -344,6 +375,7 @@ function updateEffectImpl(
   } satisfies Effect;
 }
 
+/** 首次 useEffect：登记 Passive 类型的 Effect。 */
 function mountEffect(
   create: () => (() => void) | void,
   deps: unknown[] | undefined,
@@ -351,6 +383,7 @@ function mountEffect(
   mountEffectImpl(Passive, HookPassive, create, deps);
 }
 
+/** 更新 useEffect：比较 deps，必要时登记 Passive 工作。 */
 function updateEffect(
   create: () => (() => void) | void,
   deps: unknown[] | undefined,
@@ -358,6 +391,7 @@ function updateEffect(
   updateEffectImpl(Passive, HookPassive, create, deps);
 }
 
+/** 首次 useLayoutEffect：登记 Layout 类型的 Effect。 */
 function mountLayoutEffect(
   create: () => (() => void) | void,
   deps: unknown[] | undefined,
@@ -365,6 +399,7 @@ function mountLayoutEffect(
   mountEffectImpl(UpdateFlag, HookLayout, create, deps);
 }
 
+/** 更新 useLayoutEffect：比较 deps，必要时登记 Layout 工作。 */
 function updateLayoutEffect(
   create: () => (() => void) | void,
   deps: unknown[] | undefined,
@@ -372,12 +407,14 @@ function updateLayoutEffect(
   updateEffectImpl(UpdateFlag, HookLayout, create, deps);
 }
 
+/** 首次渲染使用的 Hook 实现表：每次调用都向链表追加新格。 */
 const HooksDispatcherOnMount: Dispatcher = {
   useState: mountState as Dispatcher['useState'],
   useEffect: mountEffect,
   useLayoutEffect: mountLayoutEffect,
 };
 
+/** 更新渲染使用的 Hook 实现表：每次调用都按顺序克隆 current 对应格。 */
 const HooksDispatcherOnUpdate: Dispatcher = {
   useState: updateState as Dispatcher['useState'],
   useEffect: updateEffect,

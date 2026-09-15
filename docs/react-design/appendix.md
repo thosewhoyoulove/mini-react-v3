@@ -104,26 +104,30 @@
 
 ## 用 demo 验证
 
-demo 入口是 `demos/hello-dom/src/main.ts`。运行 `pnpm dev` 后，用三次交互把口述和行为对上：
+demo 入口是 `demos/hello-dom/src/main.ts`。运行 `pnpm dev` 后，页面按 State、Keyed Diff、Effect 拆成三个独立实验：
 
-**点 `+1`：DefaultLane、文本更新与 Effect**
+**State 卡片：DefaultLane、更新队列与文本更新**
 
 - `setCount` 进入环形队列，标 `DefaultLane`，在 Scheduler callback 中继续并发工作。
-- `App` 再执行，`updateState` 计算新值；HostText 复用并打 `Update`。
-- Mutation 调 `commitTextUpdate`；当前 demo 没有 `useLayoutEffect`，随后 Passive Effect 在后续任务中更新 title。
-- 再点一次，可观察 Passive cleanup 先于新 create。
+- `StateDemo` 再执行，`updateState` 计算新值；HostText 复用并打 `Update`，Mutation 调 `commitTextUpdate`。
+- 点 `+3（函数式）` 会在同一事件里入队三条 action，只约一次同档工作，最终从 0 依次算到 3。
 
-**点 `reverse`：keyed 列表移动**
+**Keyed Diff 卡片：复用、移动、新建与删除**
 
-- `<li key={item}>` 的 key 稳定，数组 Diff 在 Map 中按 key 找回旧 Fiber。
+- 点 `reverse`：`<li key={item}>` 的 key 稳定，数组 Diff 在 Map 中按 key 找回旧 Fiber。
 - `lastPlacedIndex` 给需要移动的节点打 `Placement`，Commit 移动已有 DOM，而不是全部重建。
+- 点 `add`：新 key 没有可复用旧 Fiber，`completeWork` 创建实例，Commit 插到 `ul` 末尾。
+- 点 `remove first`：旧 Fiber 进入父节点 `deletions`，Mutation 阶段从 DOM 删除。
 
-**点 `add`：列表尾部新建**
+**Effect 卡片：Layout / Passive 的阶段差异**
 
-- 新 `li` 没有可复用旧 Fiber，`placeChild` 打 `Placement`。
-- `completeWork` 创建实例，Commit 把它插到 `ul` 末尾。
+- 点 `next value`：Layout cleanup 在 Mutation，Layout create 在切换 current 后同步运行；日志里的 `DOM=...` 可以证明它读到新 DOM。
+- Passive cleanup / create 由 Scheduler 放到后续宏任务，日志顺序与 Layout 分开。
+- 点 `unmount`：教学版会在 Mutation 中同步执行被删子树的 Layout 与 Passive cleanup，这是与官方删除路径不同的简化。
 
 首次进入页面则是：`createRoot().render(...)` → `SyncLane` → 微任务中的同步工作循环。它与 `+1` 共用 begin / complete / commit 主线，差别在 Lane 和是否存在 current 子树。
+
+自动验证运行 `pnpm test`。内存 HostConfig 会保留宿主节点对象身份，所以测试不仅检查最终文本，还能证明 keyed Diff 是复用并移动旧节点。`pnpm typecheck` 同时检查所有 packages、demo 和测试源码。
 
 ## 教学实现与官方 React 的差异
 

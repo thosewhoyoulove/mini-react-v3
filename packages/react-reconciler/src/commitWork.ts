@@ -42,10 +42,12 @@ import {
  * useLayoutEffect 打的是 Update（和 Host DOM 更新共用），按 fiber.tag 分叉。
  */
 
+/** HostComponent 和 HostRoot 才能直接承接宿主节点。 */
 function isHostParent(fiber: Fiber): boolean {
   return fiber.tag === HostComponent || fiber.tag === HostRoot;
 }
 
+/** 从当前 Fiber 向上找到最近的 DOM 元素或根容器 Fiber。 */
 function getHostParentFiber(fiber: Fiber): Fiber {
   if (isHostParent(fiber)) {
     return fiber;
@@ -60,33 +62,48 @@ function getHostParentFiber(fiber: Fiber): Fiber {
   throw new Error('Expected to find a host parent');
 }
 
+/**
+ * 找 Placement 节点右边第一个“已经在宿主树中”的稳定兄弟。
+ *
+ * 只做四步：
+ *   1. 当前层没有 sibling 就向上，碰到宿主父节点表示后面没有锚点
+ *   2. 找到 sibling 后转入它的子树
+ *   3. 向下寻找 Host 节点；带 Placement 的新子树不能作为锚点，整棵跳过
+ *   4. 返回第一个不带 Placement 的 Host 实例，找不到则返回 null 表示 append
+ *
+ * 这一步让列表移动能使用 insertBefore，而不必预先计算 DOM 下标。
+ */
 function getHostSibling(fiber: Fiber): any {
   let node: Fiber = fiber;
   siblings: while (true) {
     while (node.sibling == null) {
       if (node.return == null || isHostParent(node.return)) {
-        return null;
+        return null; // 1. 已升到宿主父边界，右侧没有稳定兄弟
       }
-      node = node.return;
+      node = node.return; // 1. 到父层继续找 sibling
     }
     node.sibling.return = node.return;
-    node = node.sibling;
+    node = node.sibling; // 2. 从右侧兄弟开始寻找宿主锚点
     while (node.tag !== HostComponent && node.tag !== HostText) {
       if ((node.flags & Placement) !== 0) {
-        continue siblings;
+        continue siblings; // 3. 这个子树自己也待插入，不能当 before
       }
       if (node.child == null) {
-        continue siblings;
+        continue siblings; // 3. 非 Host 叶子没有可用实例
       }
       node.child.return = node;
-      node = node.child;
+      node = node.child; // 3. 函数组件等没有实例，继续向下
     }
     if ((node.flags & Placement) === 0) {
-      return node.stateNode;
+      return node.stateNode; // 4. 已挂载 Host 可以作为 insertBefore 锚点
     }
   }
 }
 
+/**
+ * 把一个 Placement Fiber 对应的宿主节点插进 parent。
+ * Fiber 本身若没有 stateNode（例如函数组件），就递归插入它的直接宿主后代。
+ */
 function insertOrAppendPlacementNode(
   node: Fiber,
   before: any,
@@ -117,21 +134,31 @@ function insertOrAppendPlacementNode(
   }
 }
 
+/**
+ * 提交一个 Placement。
+ *
+ * 只做四步：
+ *   1. 向上找到最近宿主父 Fiber
+ *   2. 区分根容器与普通 HostComponent，取得真实 parent
+ *   3. 向右找到稳定宿主兄弟作为 before
+ *   4. 插入当前 Host，或递归插入非 Host Fiber 的宿主后代
+ */
 function commitPlacement(finishedWork: Fiber): void {
-  const parentFiber = getHostParentFiber(finishedWork.return!);
-  const isContainer = parentFiber.tag === HostRoot;
+  const parentFiber = getHostParentFiber(finishedWork.return!); // 1
+  const isContainer = parentFiber.tag === HostRoot; // 2
   const parentStateNode = isContainer
     ? (parentFiber.stateNode as FiberRoot).containerInfo
     : parentFiber.stateNode;
-  const before = getHostSibling(finishedWork);
+  const before = getHostSibling(finishedWork); // 3. null 表示追加到末尾
   insertOrAppendPlacementNode(
     finishedWork,
     before,
     parentStateNode,
     isContainer,
-  );
+  ); // 4
 }
 
+/** 深度优先执行被删除子树中的 Layout / Passive cleanup。 */
 function unmountEffects(fiber: Fiber): void {
   if (fiber.tag === FunctionComponent) {
     commitHookEffectListUnmount(fiber, HookLayout);
@@ -145,6 +172,10 @@ function unmountEffects(fiber: Fiber): void {
   }
 }
 
+/**
+ * 从宿主父节点删除一棵 Fiber 子树的顶层宿主节点。
+ * 删除 HostComponent 时浏览器会连带移除其 DOM 后代；函数组件则继续向下寻找 Host。
+ */
 function commitHostUnmount(
   fiber: Fiber,
   parent: any,
@@ -166,6 +197,7 @@ function commitHostUnmount(
   }
 }
 
+/** 删除一棵旧子树：先清理 Effect，再修改宿主树。 */
 function commitDeletion(deletedFiber: Fiber, nearestMountedAncestor: Fiber): void {
   unmountEffects(deletedFiber);
   const parentFiber = getHostParentFiber(nearestMountedAncestor);
@@ -176,6 +208,7 @@ function commitDeletion(deletedFiber: Fiber, nearestMountedAncestor: Fiber): voi
   commitHostUnmount(deletedFiber, parentStateNode, isContainer);
 }
 
+/** 按 Fiber tag 把 Update flag 翻译为宿主属性更新或文本更新。 */
 function commitWork(finishedWork: Fiber): void {
   const hostConfig = getHostConfig();
   switch (finishedWork.tag) {
@@ -215,6 +248,8 @@ function commitWork(finishedWork: Fiber): void {
  *   2. 子树带 MutationMask → 先处理孩子（深度优先）
  *   3. Placement → 插入或移动真实 DOM
  *   4. Update → Host 改属性；FunctionComponent 跑 useLayoutEffect destroy
+ *
+ * Placement 和 Update 可能同时存在，必须用两个 if 分别消费，不能互斥。
  */
 function commitMutationEffectsOnFiber(finishedWork: Fiber): void {
   const flags = finishedWork.flags;
@@ -234,8 +269,6 @@ function commitMutationEffectsOnFiber(finishedWork: Fiber): void {
     }
   }
 
-  // Placement 和 Update 可以同时出现：列表里节点被移动，同时文本 / props 也变了。
-  // 不能写成 if / else，否则移动会吃掉更新。
   if ((flags & Placement) !== 0) {
     commitPlacement(finishedWork); // 3
     finishedWork.flags &= ~Placement;
@@ -275,6 +308,7 @@ function commitLayoutEffectsOnFiber(finishedWork: Fiber): void {
   }
 }
 
+/** 深度优先执行本轮 deps 变化的 Passive cleanup。 */
 function commitPassiveUnmountOnFiber(finishedWork: Fiber): void {
   if ((finishedWork.subtreeFlags & PassiveMask) !== 0) {
     let child = finishedWork.child;
@@ -291,6 +325,7 @@ function commitPassiveUnmountOnFiber(finishedWork: Fiber): void {
   }
 }
 
+/** 深度优先执行本轮 deps 变化的 Passive create。 */
 function commitPassiveMountOnFiber(finishedWork: Fiber): void {
   if ((finishedWork.subtreeFlags & PassiveMask) !== 0) {
     let child = finishedWork.child;
