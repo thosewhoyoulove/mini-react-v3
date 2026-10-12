@@ -41,7 +41,7 @@ export function createElement(
       key = '' + config.key; // 1. key 统一转字符串，后续 Map Diff 才能稳定比较
     }
     if (hasValidRef(config)) {
-      ref = config.ref; // 1. 当前只保存，尚未实现 ref 的 Commit 语义
+      ref = config.ref; // 1. 留给 Commit 的 Layout 阶段写入
     }
     for (const propName in config) {
       if (

@@ -5,6 +5,7 @@ export {
   NormalPriority,
   UserBlockingPriority,
   unstable_cancelCallback,
+  unstable_now,
   unstable_scheduleCallback,
   unstable_shouldYield,
 } from './Scheduler';

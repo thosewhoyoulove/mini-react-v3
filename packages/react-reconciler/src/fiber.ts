@@ -1,5 +1,11 @@
 import { NoFlags } from './fiberFlags';
 import { NoLanes } from './fiberLanes';
+import {
+  REACT_FORWARD_REF_TYPE,
+  REACT_FRAGMENT_TYPE,
+  REACT_MEMO_TYPE,
+  REACT_SUSPENSE_TYPE,
+} from 'shared';
 
 /**
  * Fiber：协调器内部的工作单元。
@@ -39,9 +45,40 @@ export const HostRoot = 3;
 export const HostComponent = 5;
 /** 文本节点，如 'Mini React'、'count: ' + count */
 export const HostText = 6;
+/** Fragment：协调子节点，但不创建宿主实例。 */
+export const Fragment = 7;
+/** Context.Provider。memoizedState 保存上一轮 value。 */
+export const ContextProvider = 10;
+/** forwardRef(render) 的包装类型。ref 作为渲染函数的第二个参数。 */
+export const ForwardRef = 11;
+/** Suspense。子树抛出 thenable 时改提交 fallback。 */
+export const SuspenseComponent = 13;
+/** memo(Component)。props 比较通过就跳过内部函数。 */
+export const MemoComponent = 14;
+
+/**
+ * useContext 在 Fiber 上记下的一格依赖。
+ * bailout 时拿 memoizedValue 和 context._currentValue 比，变了就不能跳。
+ */
+export type ContextDependency = {
+  /** 读取的那个 context 对象。 */
+  context: { _currentValue: any };
+
+  /** 这次 render 读到的值。 */
+  memoizedValue: any;
+
+  /** 同一个组件里下一次 useContext。 */
+  next: ContextDependency | null;
+};
+
+/** 函数组件本次 render 收集到的 context 依赖链表。 */
+export type Dependencies = {
+  /** 链表头。没有 useContext 时为 null。 */
+  firstContext: ContextDependency | null;
+};
 
 export interface Fiber {
-  /** 上面四个 tag 常量之一，决定 beginWork / completeWork 走哪条分支 */
+  /** tag 常量之一，决定 beginWork / completeWork 走哪条分支 */
   tag: number;
   /**
    * 节点「是什么」。
@@ -100,11 +137,16 @@ export interface Fiber {
    */
   lanes: number;
   /**
-   * 子树里还有没有没处理的更新。官方 beginWork 用它做 bailout：
-   * childLanes 与本轮 renderLanes 无交集就可以跳过整棵子树。
-   * 本教学实现先记下这个字段，beginWork 暂未跳过。
+   * 子树里还有没有没处理的更新。
+   * beginWork 看到 childLanes 与本轮 renderLanes 有交集时，不能跳过父函数。
    */
   childLanes: number;
+
+  /** 从 ReactElement 拆出来的 ref。Layout 阶段写入，卸载时清空。 */
+  ref: any;
+
+  /** useContext 依赖。bailout 前用来发现 Provider value 已经变了。 */
+  dependencies: Dependencies | null;
 }
 
 /**
@@ -160,6 +202,8 @@ export function createFiber(
     alternate: null,
     lanes: NoLanes,
     childLanes: NoLanes,
+    ref: null,
+    dependencies: null,
   };
 }
 
@@ -209,6 +253,8 @@ export function createWorkInProgress(
   wip.index = current.index;
   wip.lanes = current.lanes;
   wip.childLanes = current.childLanes;
+  wip.ref = current.ref;
+  wip.dependencies = current.dependencies;
   wip.return = null;
   return wip;
 }
@@ -225,14 +271,42 @@ export function createWorkInProgress(
  * pendingProps 直接等于 element.props（含 children）。
  * returnFiber 是父节点，链表的 return 指针现在就接上。
  */
+/**
+ * 按 element.type 的形状选择 tag。
+ * 函数上的 _context 表示 Provider；对象上的 $$typeof 表示 memo / forwardRef / Suspense。
+ */
+function tagFromType(type: any): number {
+  if (type === REACT_FRAGMENT_TYPE) {
+    return Fragment;
+  }
+  if (typeof type === 'function') {
+    if (type._context != null) {
+      return ContextProvider;
+    }
+    return FunctionComponent;
+  }
+  if (type != null && typeof type === 'object') {
+    if (type.$$typeof === REACT_MEMO_TYPE) {
+      return MemoComponent;
+    }
+    if (type.$$typeof === REACT_FORWARD_REF_TYPE) {
+      return ForwardRef;
+    }
+    if (type.$$typeof === REACT_SUSPENSE_TYPE) {
+      return SuspenseComponent;
+    }
+  }
+  return HostComponent;
+}
+
 export function createFiberFromElement(
-  element: { type: any; key: string | null; props: any },
+  element: { type: any; key: string | null; props: any; ref?: any },
   returnFiber: Fiber,
 ): Fiber {
   const type = element.type;
-  const tag = typeof type === 'function' ? FunctionComponent : HostComponent; // 函数→组件，否则当 DOM 标签
-  const fiber = createFiber(tag, element.props, element.key);
+  const fiber = createFiber(tagFromType(type), element.props, element.key);
   fiber.type = type;
+  fiber.ref = element.ref ?? null;
   fiber.return = returnFiber;
   return fiber;
 }

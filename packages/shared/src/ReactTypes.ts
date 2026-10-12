@@ -11,7 +11,7 @@ export type Type = any;
 /** 同级 Diff 的身份标记；没有显式 key 时为 null。 */
 export type Key = string | null;
 
-/** ref 字段目前只从 config 中拆出，教学版尚未实现 Commit 写入。 */
+/** Commit 的 Layout 阶段写入；函数组件拿到 Fiber，宿主节点拿到真实实例。 */
 export type Ref = any;
 
 export interface Props {
@@ -32,7 +32,7 @@ export interface ReactElement {
   /** 只参与同级 Diff，不会进入 props。 */
   key: Key;
 
-  /** 预留给 Commit；当前仓库只保存，不消费。 */
+  /** Layout 阶段写入。对象 ref 写 current，函数 ref 直接调用。 */
   ref: Ref;
 
   /** 组件输入或宿主属性，children 也存放在这里。 */

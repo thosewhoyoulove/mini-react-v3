@@ -191,6 +191,7 @@ function ChildReconciler(shouldTrackSideEffects: boolean) {
   ): Fiber {
     if (current != null && current.type === element.type) {
       const existing = useFiber(current, element.props); // 1
+      existing.ref = element.ref ?? null;
       existing.return = returnFiber;
       return existing;
     }
@@ -338,6 +339,7 @@ function ChildReconciler(shouldTrackSideEffects: boolean) {
         if (child.type === element.type) {
           deleteRemainingChildren(returnFiber, child.sibling); // 2. 复用这个，后面都多余
           const existing = useFiber(child, element.props);
+          existing.ref = element.ref ?? null;
           existing.return = returnFiber;
           return existing;
         }

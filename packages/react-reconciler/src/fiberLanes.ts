@@ -4,12 +4,10 @@
  * 数字越小（最低位）优先级越高，和官方 ReactFiberLane.js 同一套规则：
  *   lanes & -lanes 取出最低的置位，就是当前最高优的那一条。
  *
- * 本教学实现只保留两条，方便对照 workLoop 的 sync / concurrent 分叉：
- *   SyncLane    —— root.render / 必须马上画出来
- *   DefaultLane —— setState，走 Scheduler 时间切片
- *
- * 官方还有 InputContinuous、Transition、Idle 等十几条；读源码时把它们
- * 都当成「Default 和 Sync 之间的不同档位」即可。
+ * 本教学实现保留三条，方便对照插队和可丢弃的低优渲染：
+ *   SyncLane       —— root.render / 必须马上画出来
+ *   DefaultLane    —— 普通 setState，走 Scheduler 时间切片
+ *   TransitionLane —— startTransition，可以被更高优更新整段丢掉
  */
 /** 单条更新优先级，占一个 bit。 */
 export type Lane = number;
@@ -28,6 +26,9 @@ export const SyncLane: Lane = 0b01;
 
 /** 普通优先级：用户 setState 交给 Scheduler 做可切片工作。 */
 export const DefaultLane: Lane = 0b10;
+
+/** 可被打断的低优更新。startTransition 里的 setState 走这一档。 */
+export const TransitionLane: Lane = 0b100;
 
 /**
  * 把两条（或多条）lane 并进同一个集合。按位或：哪一位曾经是 1，结果里还是 1。
@@ -73,6 +74,9 @@ export function getNextLanes(root: { pendingLanes: Lanes }): Lanes {
   }
   if (includesSomeLane(pending, DefaultLane)) {
     return DefaultLane;
+  }
+  if (includesSomeLane(pending, TransitionLane)) {
+    return TransitionLane; // 更高优都处理完，才重开被丢掉的 transition
   }
   return pending;
 }

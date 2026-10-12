@@ -1,10 +1,37 @@
-import { createElement, useEffect, useLayoutEffect, useState } from 'react';
+import {
+  ErrorBoundary,
+  Fragment,
+  Suspense,
+  createContext,
+  createElement,
+  forwardRef,
+  memo,
+  startTransition,
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from 'react';
+import {
+  ImmediatePriority,
+  LowPriority,
+  unstable_now,
+  unstable_scheduleCallback,
+} from 'scheduler';
 import {
   createContainer,
   updateContainer,
   type HostConfig,
 } from 'react-reconciler';
-import { hostConfig as domHostConfig } from '../packages/react-dom/src/hostConfig';
+import {
+  dispatchDelegatedClick,
+  hostConfig as domHostConfig,
+  peekClickHandler,
+} from '../packages/react-dom/src/hostConfig';
 
 /**
  * 不依赖浏览器的行为测试。
@@ -332,8 +359,8 @@ test('Layout 与 Passive Effect 按 Commit 阶段执行，并在依赖变化时�
   await flushSyncRender();
   equal(
     events.slice(beforeStableDeps).join(' | '),
-    'render 1',
-    'deps 不变时只重新 render，不应执行 Effect cleanup/create',
+    '',
+    'props 相同且没有 lane 时跳过函数，Effect 不会 cleanup/create',
   );
 
   updateContainer(createElement(Effects, { value: 2 }), root);
@@ -370,6 +397,9 @@ class FakeElement {
   /** Object.assign 可写入的行内样式对象。 */
   style: Record<string, unknown> = {};
 
+  /** 委托派发沿 parentNode 向上走。 */
+  parentNode: FakeElement | null = null;
+
   setAttribute(name: string, value: string): void {
     this.attributes.set(name, value);
   }
@@ -401,10 +431,12 @@ test('DOM HostConfig 会更新 className、布尔属性和 onXxx 监听器', () 
     disabled: true,
     onClick: firstClick,
   };
+  const mouseDown = () => undefined;
   const next = {
     className: 'after',
     disabled: false,
     onClick: nextClick,
+    onMouseDown: mouseDown,
   };
 
   domHostConfig.commitUpdate(
@@ -416,7 +448,401 @@ test('DOM HostConfig 会更新 className、布尔属性和 onXxx 监听器', () 
 
   equal(element.attributes.get('class'), 'after', 'className 应映射到 class');
   equal(element.attributes.has('disabled'), false, 'false 布尔属性应删除');
-  equal(element.listeners.get('click'), nextClick as EventListener, '旧监听器应替换为新监听器');
+  equal(element.listeners.has('click'), false, 'click 不在节点上 addEventListener');
+  equal(
+    peekClickHandler(element),
+    nextClick as EventListener,
+    'click 记在委托表里',
+  );
+  equal(
+    element.listeners.get('mousedown'),
+    mouseDown as EventListener,
+    '其余事件仍逐节点监听',
+  );
+
+  const parent = new FakeElement();
+  element.parentNode = parent;
+  let clicks = 0;
+  dispatchDelegatedClick({
+    target: element,
+    currentTarget: parent,
+    cancelBubble: false,
+  } as unknown as Event);
+  equal(clicks, 0, '还没把计数函数写进委托表时不应触发');
+  domHostConfig.commitUpdate(
+    element as unknown as HTMLElement,
+    'button',
+    next,
+    { onClick: () => { clicks += 1; } },
+  );
+  dispatchDelegatedClick({
+    target: element,
+    currentTarget: parent,
+    cancelBubble: false,
+  } as unknown as Event);
+  equal(clicks, 1, '容器委托只派发一次');
+});
+
+/** 读取根容器下第一个元素的文本，方便断言单节点页面。 */
+function rootText(container: TestContainer): string {
+  const first = container.children[0];
+  if (first == null || first.kind !== 'element') {
+    return '';
+  }
+  return textOf(first);
+}
+
+test('props 相同且子树没有 lane 时跳过子函数，子树有 lane 时父函数不能跳过', async () => {
+  let childRenders = 0;
+  let parentRenders = 0;
+  let setTick: (action: number | ((value: number) => number)) => void = () => {};
+  let setChild: (action: number | ((value: number) => number)) => void = () => {};
+
+  function Child() {
+    childRenders += 1;
+    const [n, setN] = useState(0);
+    setChild = setN;
+    return createElement('span', null, 'c' + n);
+  }
+
+  function Parent() {
+    parentRenders += 1;
+    const [tick, set] = useState(0);
+    setTick = set;
+    return createElement(
+      'div',
+      null,
+      createElement('span', null, String(tick)),
+      createElement(Child, null),
+    );
+  }
+
+  const { container, root } = createTestRoot();
+  updateContainer(createElement(Parent, null), root);
+  await flushSyncRender();
+  equal(childRenders, 1, '首次渲染子函数执行一次');
+
+  setTick(1);
+  await waitFor(() => parentRenders === 2, '父更新没有完成');
+  const div = container.children[0] as TestElement;
+  equal(textOf(div.children[0] as TestElement), '1', '父状态已经提交');
+  equal(childRenders, 1, '子函数被跳过，没有再次执行');
+
+  setChild(1);
+  await waitFor(() => childRenders === 2, '子更新没有完成');
+  equal(parentRenders, 3, '子树还有 lane 时父函数必须重跑');
+  equal(textOf(div.children[1] as TestElement), 'c1', '子状态已经提交');
+});
+
+test('Layout 阶段写入 ref，卸载时清空', async () => {
+  const hostRef: { current: TestElement | null } = { current: null };
+  const fnRef: { current: { type: unknown } | null } = { current: null };
+
+  function Box() {
+    return createElement('i', null, 'box');
+  }
+
+  const { container, root } = createTestRoot();
+  updateContainer(
+    createElement(
+      'div',
+      null,
+      createElement('span', { ref: hostRef }, 'host'),
+      createElement(Box, { ref: fnRef }),
+    ),
+    root,
+  );
+  await flushSyncRender();
+  const div = container.children[0] as TestElement;
+  equal(hostRef.current, div.children[0], '宿主 ref 指向真实实例');
+  equal(fnRef.current?.type, Box, '函数组件 ref 指向 Fiber');
+
+  updateContainer(null, root);
+  await flushSyncRender();
+  equal(hostRef.current, null, '卸载宿主时 ref 写成 null');
+  equal(fnRef.current, null, '卸载函数组件时 ref 写成 null');
+});
+
+test('useRef 保持同一对象，useReducer 按序重放，useMemo / useCallback 看依赖', async () => {
+  let renders = 0;
+  let memoCount = 0;
+  let setTick: (value: number) => void = () => {};
+  let setN: (value: number) => void = () => {};
+  let dispatch: (action: number) => void = () => {};
+  let refStable = true;
+  let seenRef: { current: number } | null = null;
+  let seenCallback: (() => number) | null = null;
+  let callbackChanged = false;
+
+  function App() {
+    renders += 1;
+    const ref = useRef(1);
+    if (seenRef == null) {
+      seenRef = ref;
+    } else if (seenRef !== ref) {
+      refStable = false;
+    }
+    const [tick, setTickState] = useState(0);
+    const [n, setNState] = useState(0);
+    const [sum, reduce] = useReducer((state: number, action: number) => state + action, 0);
+    setTick = setTickState;
+    setN = setNState;
+    dispatch = reduce;
+    const doubled = useMemo(() => {
+      memoCount += 1;
+      return n * 2;
+    }, [n]);
+    const callback = useCallback(() => n, [n]);
+    if (seenCallback == null) {
+      seenCallback = callback;
+    } else if (seenCallback !== callback) {
+      callbackChanged = true;
+      seenCallback = callback;
+    }
+    return createElement('span', null, `${tick}:${doubled}:${sum}`);
+  }
+
+  const { container, root } = createTestRoot();
+  updateContainer(createElement(App, null), root);
+  await flushSyncRender();
+  equal(rootText(container), '0:0:0', '初始 hook 状态');
+  equal(memoCount, 1, 'useMemo 首次计算一次');
+
+  setTick(1);
+  await waitFor(() => rootText(container) === '1:0:0', '无关状态更新没有提交');
+  equal(refStable, true, 'useRef 在更新后仍是同一个对象');
+  equal(memoCount, 1, '依赖没变时 useMemo 不重算');
+  equal(callbackChanged, false, '依赖没变时 useCallback 保持函数身份');
+
+  dispatch(2);
+  dispatch(3);
+  await waitFor(() => rootText(container) === '1:0:5', 'useReducer 应合并重放 2 和 3');
+
+  callbackChanged = false;
+  setN(4);
+  await waitFor(() => rootText(container) === '1:8:5', 'useMemo 依赖变化后没有提交');
+  equal(memoCount, 2, '依赖变化时 useMemo 重算一次');
+  equal(callbackChanged, true, '依赖变化时 useCallback 换成新函数');
+  equal(renders > 1, true, '更新路径确实跑过');
+});
+
+test('Fragment 不创建 DOM，两个孩子直接挂到父节点下', async () => {
+  const { container, root } = createTestRoot();
+  updateContainer(
+    createElement(
+      Fragment,
+      null,
+      createElement('span', null, 'a'),
+      createElement('span', null, 'b'),
+    ),
+    root,
+  );
+  await flushSyncRender();
+  equal(container.children.length, 2, 'Fragment 自己不是宿主节点');
+  equal(textOf(container.children[0] as TestElement), 'a', '第一个孩子保持顺序');
+  equal(textOf(container.children[1] as TestElement), 'b', '第二个孩子保持顺序');
+});
+
+test('Context value 变化时消费者不能 bailout，value 不变时可以跳过', async () => {
+  const Ctx = createContext('a');
+  let consumerRenders = 0;
+  let setTick: (value: number) => void = () => {};
+  let setValue: (value: string) => void = () => {};
+
+  function Consumer() {
+    consumerRenders += 1;
+    return createElement('span', null, useContext(Ctx));
+  }
+
+  function App() {
+    const [tick, setTickState] = useState(0);
+    const [value, setValueState] = useState('a');
+    setTick = setTickState;
+    setValue = setValueState;
+    return createElement(
+      'div',
+      null,
+      createElement('span', null, String(tick)),
+      createElement(Ctx.Provider, { value }, createElement(Consumer, null)),
+    );
+  }
+
+  const { container, root } = createTestRoot();
+  updateContainer(createElement(App, null), root);
+  await flushSyncRender();
+  equal(consumerRenders, 1, '消费者首次渲染一次');
+
+  setTick(1);
+  await waitFor(() => {
+    const div = container.children[0] as TestElement;
+    return textOf(div.children[0] as TestElement) === '1';
+  }, '父更新没有提交');
+  equal(consumerRenders, 1, 'value 没变时消费者被跳过');
+
+  setValue('b');
+  await waitFor(() => {
+    const div = container.children[0] as TestElement;
+    return textOf(div.children[1] as TestElement) === 'b';
+  }, 'context 新值没有提交');
+  equal(consumerRenders, 2, 'value 变化时即使 props 相同也不能跳过');
+});
+
+test('memo 比较通过时跳过内部函数，forwardRef 把 ref 交给宿主节点', async () => {
+  let memoRenders = 0;
+  let setTick: (value: number) => void = () => {};
+  let setN: (value: number) => void = () => {};
+  const hostRef: { current: TestElement | null } = { current: null };
+
+  const Box = memo(function Box(props: { n: number }) {
+    memoRenders += 1;
+    return createElement('span', null, String(props.n));
+  });
+
+  const Fancy = forwardRef(function Fancy(
+    _props: Record<string, never>,
+    ref: { current: TestElement | null },
+  ) {
+    return createElement('b', { ref }, 'ref');
+  });
+
+  function App() {
+    const [tick, setTickState] = useState(0);
+    const [n, setNState] = useState(1);
+    setTick = setTickState;
+    setN = setNState;
+    return createElement(
+      'div',
+      null,
+      createElement('span', null, String(tick)),
+      createElement(Box, { n }),
+      createElement(Fancy, { ref: hostRef }),
+    );
+  }
+
+  const { container, root } = createTestRoot();
+  updateContainer(createElement(App, null), root);
+  await flushSyncRender();
+  const div = container.children[0] as TestElement;
+  equal(memoRenders, 1, 'memo 首次渲染内部函数');
+  equal(hostRef.current, div.children[2], 'forwardRef 的 ref 指向内部宿主节点');
+
+  setTick(1);
+  await waitFor(() => textOf(div.children[0] as TestElement) === '1', '父更新没有提交');
+  equal(memoRenders, 1, 'props 浅比较通过时 memo 跳过内部函数');
+
+  setN(2);
+  await waitFor(() => textOf(div.children[1] as TestElement) === '2', 'memo 更新没有提交');
+  equal(memoRenders, 2, 'props 变化时 memo 进入内部函数');
+});
+
+test('高优更新丢掉进行中的 transition，被丢掉的渲染不会提交', async () => {
+  const renders: string[] = [];
+  const committed: string[] = [];
+  let setT: (value: number) => void = () => {};
+
+  function App() {
+    const [n, setN] = useState(0);
+    const [t, setTState] = useState(0);
+    setT = setTState;
+    renders.push(`${n}:${t}`);
+    if (t === 1 && n === 0) {
+      setN(1); // 渲染进行中插入更高优更新
+    }
+    useLayoutEffect(() => {
+      committed.push(`${n}:${t}`);
+    });
+    return createElement('span', null, `${n}:${t}`);
+  }
+
+  const { container, root } = createTestRoot();
+  updateContainer(createElement(App, null), root);
+  await flushSyncRender();
+  startTransition(() => {
+    setT(1);
+  });
+  await waitFor(
+    () => committed.includes('1:1') && rootText(container) === '1:1',
+    'transition 重开后没有提交最终状态',
+  );
+  equal(renders.includes('0:1'), true, '被丢掉的 transition 渲染确实跑过');
+  equal(committed.includes('0:1'), false, '被丢掉的 WIP 没有进入 Commit');
+});
+
+test('Scheduler 按优先级出堆，unstable_now 返回数字', async () => {
+  const order: string[] = [];
+  unstable_scheduleCallback(LowPriority, () => {
+    order.push('low');
+  });
+  unstable_scheduleCallback(ImmediatePriority, () => {
+    order.push('now');
+  });
+  await waitFor(() => order.length === 2, '两个 Scheduler 任务没有跑完');
+  equal(order.join(','), 'now,low', 'Immediate 先于 Low 出堆');
+  equal(typeof unstable_now(), 'number', 'unstable_now 返回当前时间');
+});
+
+test('渲染抛错时提交边界 fallback，current 树不会停在半截', async () => {
+  function Boom(props: { crash: boolean }) {
+    if (props.crash) {
+      throw new Error('boom');
+    }
+    return createElement('span', null, 'ok');
+  }
+
+  const { container, root } = createTestRoot();
+  updateContainer(
+    createElement(
+      ErrorBoundary,
+      { fallback: createElement('span', null, 'fallback') },
+      createElement(Boom, { crash: false }),
+    ),
+    root,
+  );
+  await flushSyncRender();
+  equal(rootText(container), 'ok', '出错前提交的是正常子树');
+
+  updateContainer(
+    createElement(
+      ErrorBoundary,
+      { fallback: createElement('span', null, 'fallback') },
+      createElement(Boom, { crash: true }),
+    ),
+    root,
+  );
+  await flushSyncRender();
+  equal(rootText(container), 'fallback', '边界提交 fallback');
+  equal(container.children.length, 1, '半截出错子树没有留在宿主树上');
+});
+
+test('Suspense 先提交 fallback，thenable 完成后按原 lane 重试', async () => {
+  let value: string | null = null;
+  let resolvePromise: () => void = () => {};
+  const promise = new Promise<void>((resolve) => {
+    resolvePromise = resolve;
+  });
+
+  function Reader() {
+    if (value == null) {
+      throw promise;
+    }
+    return createElement('span', null, value);
+  }
+
+  const { container, root } = createTestRoot();
+  updateContainer(
+    createElement(
+      Suspense,
+      { fallback: createElement('span', null, 'loading') },
+      createElement(Reader, null),
+    ),
+    root,
+  );
+  await flushSyncRender();
+  equal(rootText(container), 'loading', '挂起时提交 fallback');
+
+  value = 'done';
+  resolvePromise();
+  await waitFor(() => rootText(container) === 'done', 'thenable 完成后没有重试成功');
 });
 
 let failed = 0;

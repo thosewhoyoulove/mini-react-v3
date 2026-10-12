@@ -1,8 +1,8 @@
 import type { Dispatcher } from 'react';
-import { ReactCurrentDispatcher } from 'react';
+import { ReactCurrentBatchConfig, ReactCurrentDispatcher } from 'react';
 import { Passive, Update as UpdateFlag } from './fiberFlags';
-import type { Fiber } from './fiber';
-import { DefaultLane } from './fiberLanes';
+import type { ContextDependency, Fiber } from './fiber';
+import { DefaultLane, TransitionLane, type Lane } from './fiberLanes';
 import { scheduleUpdateOnFiber } from './scheduleUpdate';
 
 /**
@@ -38,7 +38,10 @@ type UpdateQueue<S> = {
   pending: Update<S> | null;
 
   /** 绑在这个 hook 上的 setState。mount 时创建，之后一直复用。 */
-  dispatch: ((action: S | ((prev: S) => S)) => void) | null;
+  dispatch: ((action: any) => void) | null;
+
+  /** useReducer 的 reducer。useState 不使用。 */
+  lastRenderedReducer: ((state: S, action: any) => S) | null;
 };
 
 /** 函数组件 Fiber.memoizedState 链表中的一格。 */
@@ -198,33 +201,45 @@ function updateWorkInProgressHook(): Hook {
   return workInProgressHook; // 4. 把这格克隆交给 updateState / updateEffectImpl
 }
 
+/** startTransition 里走 TransitionLane，其余 setState 仍是 DefaultLane。 */
+function requestUpdateLane(): Lane {
+  return ReactCurrentBatchConfig.transition != null ? TransitionLane : DefaultLane;
+}
+
 /**
- * setState 的稳定闭包最终进入这里。
+ * 把一条 action 插进环形 pending，并按当前 lane 发起调度。
  *
- * 只做四步：
- *   1. 把 action 包成一条 Update
- *   2. 插进 queue.pending 环形链表的尾部
- *   3. pending 始终指向最新尾节点，pending.next 因而是最老节点
- *   4. 给闭包捕获的 Fiber 标 DefaultLane 并发起调度
+ * 1. 包成 Update
+ * 2. 接到环尾
+ * 3. pending 指向新尾
+ * 4. scheduleUpdateOnFiber
  */
+function enqueueUpdate<S>(
+  fiber: Fiber,
+  queue: UpdateQueue<S>,
+  action: any,
+): void {
+  const update = {
+    action,
+    next: null as unknown as Update<S>,
+  }; // 1
+  const pending = queue.pending;
+  if (pending == null) {
+    update.next = update; // 2
+  } else {
+    update.next = pending.next;
+    pending.next = update;
+  }
+  queue.pending = update; // 3
+  scheduleUpdateOnFiber(fiber, requestUpdateLane()); // 4
+}
+
 function dispatchSetState(
   fiber: Fiber,
   queue: UpdateQueue<any>,
   action: any,
 ): void {
-  const update = {
-    action,
-    next: null as unknown as Update<any>,
-  }; // 1. next 会在接环时补上
-  const pending = queue.pending;
-  if (pending == null) {
-    update.next = update; // 2. 第一条自己首尾相接
-  } else {
-    update.next = pending.next; // 2. 新尾先指向旧头
-    pending.next = update; // 2. 旧尾再接到新尾
-  }
-  queue.pending = update; // 3. pending 指针挪到新尾
-  scheduleUpdateOnFiber(fiber, DefaultLane); // 4. 用户 setState 可切片；root.render 才走 SyncLane
+  enqueueUpdate(fiber, queue, action);
 }
 
 /**
@@ -248,6 +263,7 @@ function mountState<S>(
   const queue: UpdateQueue<S> = {
     pending: null,
     dispatch: null,
+    lastRenderedReducer: null,
   };
   hook.queue = queue; // 3. current / wip 之后都会复用同一个 queue
   const fiber = currentlyRenderingFiber!;
@@ -407,11 +423,175 @@ function updateLayoutEffect(
   updateEffectImpl(UpdateFlag, HookLayout, create, deps);
 }
 
+/** 首次 useRef：造一个 { current }，之后更新只返回这同一个对象。 */
+function mountRef<T>(initialValue: T): { current: T } {
+  const hook = mountWorkInProgressHook(); // 1
+  const ref = { current: initialValue };
+  hook.memoizedState = ref; // 2
+  return ref; // 3
+}
+
+/** 更新 useRef：不看 initialValue，直接返回 mount 时那个对象。 */
+function updateRef<T>(_initialValue: T): { current: T } {
+  const hook = updateWorkInProgressHook(); // 1
+  return hook.memoizedState; // 2
+}
+
+/**
+ * 重放 reducer 队列。
+ *
+ * 1. 对齐并克隆当前 Hook
+ * 2. pending 并进 baseQueue，写回 current，供中断后重放
+ * 3. 从最老的 action 开始 reducer(state, action)
+ * 4. 写下最终 state 并清空已消费队列
+ */
+function updateReducer<S, A>(
+  reducer: (state: S, action: A) => S,
+): [S, (action: A) => void] {
+  const hook = updateWorkInProgressHook(); // 1
+  const queue = hook.queue as UpdateQueue<S>;
+  queue.lastRenderedReducer = reducer as (state: S, action: any) => S;
+  const pending = queue.pending;
+  let baseQueue = currentHook!.baseQueue as Update<S> | null;
+  if (pending != null) {
+    if (baseQueue != null) {
+      baseQueue = mergeCircularQueues(baseQueue, pending);
+    } else {
+      baseQueue = pending;
+    }
+    currentHook!.baseQueue = baseQueue; // 2
+    queue.pending = null;
+  }
+  if (baseQueue != null) {
+    const first = baseQueue.next;
+    let newState = currentHook!.memoizedState as S;
+    let update = first;
+    do {
+      newState = reducer(newState, update.action as A); // 3
+      update = update.next;
+    } while (update !== first);
+    hook.memoizedState = newState; // 4
+    hook.baseQueue = null;
+  }
+  return [hook.memoizedState as S, queue.dispatch as (action: A) => void];
+}
+
+/** 首次 useReducer：initial 只算一次，dispatch 闭包捕获 Fiber 与 queue。 */
+function mountReducer<S, A>(
+  reducer: (state: S, action: A) => S,
+  initialArg: S,
+  init?: (initialArg: S) => S,
+): [S, (action: A) => void] {
+  const hook = mountWorkInProgressHook(); // 1
+  const memoizedState = init !== undefined ? init(initialArg) : initialArg;
+  hook.memoizedState = memoizedState; // 2
+  const queue: UpdateQueue<S> = {
+    pending: null,
+    dispatch: null,
+    lastRenderedReducer: reducer as (state: S, action: any) => S,
+  };
+  hook.queue = queue;
+  const fiber = currentlyRenderingFiber!;
+  const dispatch = (action: A) => {
+    enqueueUpdate(fiber, queue, action); // 3
+  };
+  queue.dispatch = dispatch;
+  return [memoizedState, dispatch]; // 4
+}
+
+/** 首次 useMemo：立刻计算，把 [值, deps] 放进这一格。 */
+function mountMemo<T>(create: () => T, deps: unknown[] | undefined): T {
+  const hook = mountWorkInProgressHook(); // 1
+  const nextValue = create();
+  hook.memoizedState = [nextValue, deps]; // 2
+  return nextValue; // 3
+}
+
+/** 更新 useMemo：deps 相同就返回旧值，否则重算并换掉缓存。 */
+function updateMemo<T>(create: () => T, deps: unknown[] | undefined): T {
+  const hook = updateWorkInProgressHook(); // 1
+  const prev = hook.memoizedState as [T, unknown[] | undefined];
+  if (areHookInputsEqual(deps, prev[1])) {
+    return prev[0]; // 2
+  }
+  const nextValue = create();
+  hook.memoizedState = [nextValue, deps]; // 3
+  return nextValue;
+}
+
+/** 首次 useCallback：缓存函数本身。 */
+function mountCallback<T>(callback: T, deps: unknown[] | undefined): T {
+  const hook = mountWorkInProgressHook(); // 1
+  hook.memoizedState = [callback, deps]; // 2
+  return callback; // 3
+}
+
+/** 更新 useCallback：deps 相同返回旧函数，保证传给子组件的身份稳定。 */
+function updateCallback<T>(callback: T, deps: unknown[] | undefined): T {
+  const hook = updateWorkInProgressHook(); // 1
+  const prev = hook.memoizedState as [T, unknown[] | undefined];
+  if (areHookInputsEqual(deps, prev[1])) {
+    return prev[0]; // 2
+  }
+  hook.memoizedState = [callback, deps]; // 3
+  return callback;
+}
+
+/**
+ * 读取 context，并把这次读到的值接到正在渲染的 Fiber 上。
+ *
+ * 1. 取 Provider 已经 push 好的 _currentValue
+ * 2. 追加一格 ContextDependency
+ * 3. 返回这个值
+ */
+function readContext<T>(context: { _currentValue: T }): T {
+  const value = context._currentValue; // 1
+  const fiber = currentlyRenderingFiber;
+  if (fiber != null) {
+    const dependency: ContextDependency = {
+      context,
+      memoizedValue: value,
+      next: null,
+    }; // 2
+    const dependencies = fiber.dependencies;
+    if (dependencies == null || dependencies.firstContext == null) {
+      fiber.dependencies = { firstContext: dependency };
+    } else {
+      let cursor = dependencies.firstContext;
+      while (cursor.next != null) {
+        cursor = cursor.next;
+      }
+      cursor.next = dependency;
+    }
+  }
+  return value; // 3
+}
+
+/**
+ * bailout 前问：上次读到的 context 值是不是已经过期。
+ * Provider 在子节点 beginWork 之前会改 _currentValue。
+ */
+export function hasContextChanged(fiber: Fiber): boolean {
+  let dependency = fiber.dependencies?.firstContext ?? null;
+  while (dependency != null) {
+    if (!Object.is(dependency.memoizedValue, dependency.context._currentValue)) {
+      return true;
+    }
+    dependency = dependency.next;
+  }
+  return false;
+}
+
 /** 首次渲染使用的 Hook 实现表：每次调用都向链表追加新格。 */
 const HooksDispatcherOnMount: Dispatcher = {
   useState: mountState as Dispatcher['useState'],
   useEffect: mountEffect,
   useLayoutEffect: mountLayoutEffect,
+  useRef: mountRef as Dispatcher['useRef'],
+  useReducer: mountReducer as Dispatcher['useReducer'],
+  useMemo: mountMemo as Dispatcher['useMemo'],
+  useCallback: mountCallback as Dispatcher['useCallback'],
+  useContext: readContext as Dispatcher['useContext'],
 };
 
 /** 更新渲染使用的 Hook 实现表：每次调用都按顺序克隆 current 对应格。 */
@@ -419,6 +599,11 @@ const HooksDispatcherOnUpdate: Dispatcher = {
   useState: updateState as Dispatcher['useState'],
   useEffect: updateEffect,
   useLayoutEffect: updateLayoutEffect,
+  useRef: updateRef as Dispatcher['useRef'],
+  useReducer: updateReducer as Dispatcher['useReducer'],
+  useMemo: updateMemo as Dispatcher['useMemo'],
+  useCallback: updateCallback as Dispatcher['useCallback'],
+  useContext: readContext as Dispatcher['useContext'],
 };
 
 /**
@@ -433,12 +618,14 @@ const HooksDispatcherOnUpdate: Dispatcher = {
 export function renderWithHooks(
   current: Fiber | null,
   workInProgress: Fiber,
-  Component: (props: any) => any,
+  Component: (props: any, ref?: any) => any,
   props: any,
+  ref?: any,
 ): any {
   currentlyRenderingFiber = workInProgress;
   workInProgress.memoizedState = null; // 1. 丢掉上一轮 wip 链表，本轮从头接
   workInProgress.updateQueue = null;
+  workInProgress.dependencies = null;
   workInProgressHook = null;
   currentHook = null;
 
@@ -447,12 +634,15 @@ export function renderWithHooks(
       ? HooksDispatcherOnMount // 2. 第一次：往后接新格
       : HooksDispatcherOnUpdate; // 2. 有 current 链表：按顺序克隆对齐
 
-  const children = Component(props); // 3. 这里才会真正调到 useState / useEffect / useLayoutEffect
-
-  ReactCurrentDispatcher.current = null;
-  currentlyRenderingFiber = null;
-  workInProgressHook = null;
-  currentHook = null; // 4. 组件跑完，模块级指针不能漏到下一个组件
+  let children: any;
+  try {
+    children = Component(props, ref); // 3. forwardRef 把 ref 作为第二个参数
+  } finally {
+    ReactCurrentDispatcher.current = null;
+    currentlyRenderingFiber = null;
+    workInProgressHook = null;
+    currentHook = null; // 4. 抛错时也要清掉，避免下一个组件用到半截游标
+  }
   return children;
 }
 

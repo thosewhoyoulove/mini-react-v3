@@ -5,14 +5,21 @@ import type { Props } from 'shared';
  * DOM 宿主实现：把 reconciler 的抽象操作翻译成浏览器 DOM API。
  *
  * completeWork 会调用 create* 创建离屏节点；Commit 再调用 append/insert/remove
- * 和 commit* 修改已挂载树。事件采用逐节点监听，是明确的教学简化。
+ * 和 commit* 修改已挂载树。click 收到容器上再按 parentNode 派发；
+ * 其余 onXxx 仍逐节点 addEventListener，用来对照两条路径。
  */
 
 /** React 自己消费、不能直接写到 DOM attribute 的字段。 */
 const RESERVED_PROPS = new Set(['children', 'key', 'ref']);
 
-/** 每个元素当前注册的原生监听器，用于更新时精确移除旧函数。 */
+/** 每个元素当前注册的原生监听器，用于更新时精确移除旧函数。click 不在这里。 */
 const listeners = new WeakMap<HTMLElement, Map<string, EventListener>>();
+
+/** click 处理函数。容器上的唯一监听器按 parentNode 找到它。 */
+const clickHandlers = new WeakMap<object, EventListener>();
+
+/** 已经挂过 click 委托的容器，避免 createRoot 重复 addEventListener。 */
+const delegatedRoots = new WeakSet<object>();
 
 /** 把 onClick 一类 prop 转成小写原生事件名；普通 prop 返回 null。 */
 function eventNameFromProp(key: string): string | null {
@@ -45,9 +52,59 @@ function setListener(
     map.delete(eventName);
   }
   if (listener != null) {
-    domElement.addEventListener(eventName, listener); // 3. 教学版直接绑节点，不做根委托
+    domElement.addEventListener(eventName, listener); // 3. click 以外仍绑在节点上，作为委托的对照
     map.set(eventName, listener);
   }
+}
+
+/** 记下或清掉 click。真正的监听器在容器上，不在这个节点上。 */
+function setClickHandler(
+  domElement: object,
+  listener: EventListener | null,
+): void {
+  if (listener == null) {
+    clickHandlers.delete(domElement);
+    return;
+  }
+  clickHandlers.set(domElement, listener);
+}
+
+/** 测试读取当前 click 处理函数，确认它没有进 addEventListener。 */
+export function peekClickHandler(domElement: object): EventListener | undefined {
+  return clickHandlers.get(domElement);
+}
+
+/**
+ * 从事件目标向上找 click 处理函数，直到容器为止。
+ *
+ * 1. target 自己先试
+ * 2. 有处理函数就调用；cancelBubble 则停
+ * 3. 否则走到 parentNode，碰到 currentTarget 结束
+ */
+export function dispatchDelegatedClick(event: Event): void {
+  let node = event.target as (object & { parentNode?: object | null }) | null;
+  const stop = event.currentTarget;
+  while (node != null && node !== stop) {
+    const handler = clickHandlers.get(node); // 1
+    if (handler != null) {
+      handler(event); // 2
+      if (event.cancelBubble) {
+        return;
+      }
+    }
+    node = (node.parentNode ?? null) as typeof node; // 3
+  }
+}
+
+/** createRoot 时给容器挂一次 click。节点上的 onClick 只写进 clickHandlers。 */
+export function ensureRootClickDelegation(container: Element): void {
+  if (delegatedRoots.has(container)) {
+    return;
+  }
+  delegatedRoots.add(container);
+  container.addEventListener('click', (event) => {
+    dispatchDelegatedClick(event);
+  });
 }
 
 /**
@@ -69,7 +126,9 @@ function applyProps(
         continue;
       }
       const eventName = eventNameFromProp(key);
-      if (eventName != null) {
+      if (eventName === 'click') {
+        setClickHandler(domElement, null); // 1. click 只从委托表里删
+      } else if (eventName != null) {
         setListener(domElement, eventName, null); // 1. 删除已经消失的事件
       } else if (key === 'className') {
         domElement.removeAttribute('class'); // 1. className 对应真实 class attribute
@@ -87,13 +146,20 @@ function applyProps(
     }
     const value = nextProps[key];
     const eventName = eventNameFromProp(key);
+    if (eventName === 'click') {
+      setClickHandler(
+        domElement,
+        typeof value === 'function' ? (value as EventListener) : null,
+      );
+      continue; // 3. click 交给容器委托，不在节点上 addEventListener
+    }
     if (eventName != null) {
       setListener(
         domElement,
         eventName,
         typeof value === 'function' ? (value as EventListener) : null,
       );
-      continue; // 3. 事件不能当字符串 attribute 写入
+      continue; // 3. 其余事件仍逐节点监听，作为对照
     }
 
     if (key === 'className') {

@@ -1,7 +1,15 @@
 import {
+  ErrorBoundary,
+  Fragment,
+  Suspense,
+  createContext,
   createElement,
+  memo,
+  startTransition,
+  useContext,
   useEffect,
   useLayoutEffect,
+  useRef,
   useState,
 } from 'react';
 import { createRoot } from 'react-dom/client';
@@ -12,6 +20,9 @@ import { createRoot } from 'react-dom/client';
  * 1. StateDemo：观察函数式更新如何进入同一条 Hook 队列
  * 2. ListDemo：观察 key 如何决定复用、移动、新建和删除
  * 3. EffectsDemo：观察 Layout 与 Passive 的 create / cleanup 时序
+ * 4. BailoutDemo：父更新跳过子函数；子更新会把父函数拉回来
+ * 5. ContextDemo：value 不变时消费者被跳过；transition 可被高优更新丢掉
+ * 6. BoundaryDemo：错误边界、Suspense fallback，以及容器上的 click 委托
  */
 
 /** 下一次追加列表项时使用的稳定编号，避免删除后产生重复 key。 */
@@ -196,7 +207,231 @@ function EffectsDemo() {
   );
 }
 
-/** 页面入口：三个实验共用同一个 FiberRoot，但各自维护独立 Hook 链表。 */
+/** 子函数执行次数。bailout 成功时，父组件重渲染也不会增加它。 */
+let bailoutChildRenders = 0;
+
+/** 被跳过的子组件。父级只改自己的 state 时，这里不应再执行。 */
+function BailoutChild() {
+  bailoutChildRenders += 1;
+  const [n, setN] = useState(0);
+  const ref = useRef(0);
+  ref.current = n;
+  return createElement(
+    Fragment,
+    null,
+    createElement(
+      'button',
+      { onClick: () => setN((value) => value + 1) },
+      'child ' + n,
+    ),
+    createElement('span', null, ' ref ' + ref.current),
+  );
+}
+
+/**
+ * 剪枝实验。
+ *
+ * parent +1 只改父 state。子组件 props 是空对象，子树也没有 lane，beginWork 直接克隆孩子。
+ * child +1 会把 lane 标到父级 childLanes 上，父函数必须重跑。
+ */
+function BailoutDemo() {
+  const [tick, setTick] = useState(0);
+  return createElement(
+    'section',
+    { className: 'card' },
+    createElement('h2', null, '4. Bailout、ref 与 Fragment'),
+    createElement(
+      'p',
+      { className: 'value' },
+      'parent ' + tick + ' / child renders ' + bailoutChildRenders,
+    ),
+    createElement(
+      'div',
+      { className: 'row' },
+      createElement(
+        'button',
+        { onClick: () => setTick((value) => value + 1) },
+        'parent +1',
+      ),
+      createElement(BailoutChild, null),
+    ),
+    createElement(
+      'p',
+      { className: 'hint' },
+      '断点建议：canSkipUpdate → cloneChildFibers。parent +1 时 child renders 停在 1。',
+    ),
+  );
+}
+
+/** 给消费者和 memo 子树共用的值。 */
+const DemoContext = createContext('alpha');
+
+/** memo 内部函数的执行次数。props 没变时应保持不变。 */
+let memoRenders = 0;
+
+/** 只有 n 变化才进入。tick 变化时 compare 通过，直接 bailout。 */
+const MemoReadout = memo(function MemoReadout(props: { n: number }) {
+  memoRenders += 1;
+  return createElement('span', null, ' memo ' + props.n + ' / runs ' + memoRenders);
+});
+
+/** 读 context。value 不变时，即使父组件重渲染，这里也会被跳过。 */
+function ContextReadout() {
+  const value = useContext(DemoContext);
+  const renders = useRef(0);
+  renders.current += 1;
+  return createElement(
+    'span',
+    null,
+    ' context ' + value + ' / runs ' + renders.current,
+  );
+}
+
+/**
+ * 边界与优先级实验。
+ *
+ * 改 context 会禁止消费者 bailout。startTransition 里的 setText 走 TransitionLane；
+ * 若渲染过程中再 setUrgent，进行中的 transition WIP 会被丢掉。
+ */
+function ContextDemo() {
+  const [tick, setTick] = useState(0);
+  const [value, setValue] = useState('alpha');
+  const [text, setText] = useState('idle');
+  const [urgent, setUrgent] = useState(0);
+  return createElement(
+    'section',
+    { className: 'card' },
+    createElement('h2', null, '5. Context、memo 与 transition'),
+    createElement(
+      'p',
+      { className: 'value' },
+      'tick ' + tick + ' / urgent ' + urgent + ' / ' + text,
+    ),
+    createElement(
+      DemoContext.Provider,
+      { value },
+      createElement(ContextReadout, null),
+    ),
+    createElement(MemoReadout, { n: urgent }),
+    createElement(
+      'div',
+      { className: 'row' },
+      createElement(
+        'button',
+        { onClick: () => setTick((item) => item + 1) },
+        'parent +1',
+      ),
+      createElement(
+        'button',
+        {
+          onClick: () => setValue((item) => (item === 'alpha' ? 'beta' : 'alpha')),
+        },
+        'toggle context',
+      ),
+      createElement(
+        'button',
+        {
+          onClick: () => {
+            startTransition(() => {
+              setText('transition');
+            });
+            setUrgent((item) => item + 1);
+          },
+        },
+        'transition + urgent',
+      ),
+    ),
+    createElement(
+      'p',
+      { className: 'hint' },
+      '断点建议：hasContextChanged、updateMemoComponent、shouldRestartCurrentRender。',
+    ),
+  );
+}
+
+/** 点击次数。委托路径上每次点击只应加一。 */
+let delegatedClicks = 0;
+
+/** 子组件抛错时，边界改提交 fallback。 */
+function Boom(props: { crash: boolean }) {
+  if (props.crash) {
+    throw new Error('demo boundary');
+  }
+  return createElement('span', null, 'child ok');
+}
+
+/** 值还没到就抛出 thenable，Suspense 提交 fallback。 */
+function SuspendedReadout(props: { text: string | null }) {
+  if (props.text == null) {
+    throw new Promise((resolve) => {
+      setTimeout(resolve, 400);
+    });
+  }
+  return createElement('span', null, props.text);
+}
+
+/**
+ * 失败与挂起实验。
+ *
+ * 错误边界和 Suspense 都是渲染中断后的第二次 beginWork。
+ * click 只在容器上监听一次，再按 parentNode 找到按钮上的处理函数。
+ */
+function BoundaryDemo() {
+  const [crash, setCrash] = useState(false);
+  const [text, setText] = useState<string | null>('idle');
+  const [clicks, setClicks] = useState(0);
+  return createElement(
+    'section',
+    { className: 'card' },
+    createElement('h2', null, '6. 错误边界、Suspense 与事件委托'),
+    createElement(
+      ErrorBoundary,
+      { fallback: createElement('span', null, 'fallback') },
+      createElement(Boom, { crash }),
+    ),
+    createElement(
+      Suspense,
+      { fallback: createElement('span', null, ' loading') },
+      createElement(SuspendedReadout, { text }),
+    ),
+    createElement(
+      'div',
+      { className: 'row' },
+      createElement(
+        'button',
+        { onClick: () => setCrash((value) => !value) },
+        crash ? 'recover' : 'crash',
+      ),
+      createElement(
+        'button',
+        {
+          onClick: () => {
+            setText(null);
+            setTimeout(() => setText('done'), 400);
+          },
+        },
+        'suspend',
+      ),
+      createElement(
+        'button',
+        {
+          onClick: () => {
+            delegatedClicks += 1;
+            setClicks(delegatedClicks);
+          },
+        },
+        'delegated click ' + clicks,
+      ),
+    ),
+    createElement(
+      'p',
+      { className: 'hint' },
+      '断点建议：unwindWork、dispatchDelegatedClick。点击按钮只增加一次。',
+    ),
+  );
+}
+
+/** 页面入口：六张卡片共用同一个 FiberRoot，但各自维护独立 Hook 链表。 */
 function App() {
   return createElement(
     'main',
@@ -215,6 +450,9 @@ function App() {
     createElement(StateDemo, null),
     createElement(ListDemo, null),
     createElement(EffectsDemo, null),
+    createElement(BailoutDemo, null),
+    createElement(ContextDemo, null),
+    createElement(BoundaryDemo, null),
   );
 }
 

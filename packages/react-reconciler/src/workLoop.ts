@@ -1,24 +1,28 @@
 import {
+  LowPriority,
   NormalPriority,
   unstable_cancelCallback,
   unstable_scheduleCallback,
   unstable_shouldYield,
 } from 'scheduler';
-import { beginWork } from './beginWork';
+import { beginWork, isErrorBoundaryFiber, popProvidersAbove } from './beginWork';
 import { commitRoot } from './commitWork';
 import { completeWork } from './completeWork';
 import {
   HostRoot,
+  SuspenseComponent,
   createHostRootFiber,
   createWorkInProgress,
   type Fiber,
   type FiberRoot,
 } from './fiber';
+import { DidCapture } from './fiberFlags';
 import {
   DefaultLane,
   NoLane,
   NoLanes,
   SyncLane,
+  TransitionLane,
   getHighestPriorityLane,
   getNextLanes,
   includesSomeLane,
@@ -127,16 +131,82 @@ function markUpdateLaneFromFiberToRoot(sourceFiber: Fiber, lane: Lane): FiberRoo
  * 有 child → 下一轮处理 child（深度优先往下）。
  * 没有 child（叶子）→ 转入 completeUnitOfWork，开始往上收。
  */
+/** 同一个 thenable 只补订一次重试，避免重复 throw 时约出多轮同样的更新。 */
+const scheduledThenables = new WeakSet<object>();
+
+/** Promise 或带 then 的对象。Suspense 只认这种抛出。 */
+function isThenable(value: unknown): value is PromiseLike<unknown> & object {
+  return (
+    typeof value === 'object' &&
+    value != null &&
+    typeof (value as { then?: unknown }).then === 'function'
+  );
+}
+
+/**
+ * 渲染中断：沿 return 找到边界，丢掉边界内部的半截 WIP。
+ *
+ * 1. thenable → 停在 Suspense，下一轮 beginWork 改渲染 fallback
+ * 2. 普通错误 → 停在带 isErrorBoundary 的函数组件
+ * 3. 记下原 lane，thenable 完成后再用这一档重试
+ * 4. 找不到边界就把错误继续抛出
+ */
+function unwindWork(source: Fiber, error: unknown): void {
+  const suspended = isThenable(error);
+  let node = source.return;
+  while (node != null) {
+    if (
+      suspended &&
+      node.tag === SuspenseComponent &&
+      (node.flags & DidCapture) === 0
+    ) {
+      node.flags |= DidCapture; // 1
+      popProvidersAbove(node);
+      const thenable = error;
+      const boundary = node;
+      const lane = getHighestPriorityLane(workInProgressRootRenderLanes);
+      if (!scheduledThenables.has(thenable)) {
+        scheduledThenables.add(thenable);
+        thenable.then(() => {
+          scheduleUpdateOnFiberImpl(
+            boundary,
+            lane === NoLane ? DefaultLane : lane,
+          ); // 3
+        });
+      }
+      workInProgress = node;
+      return;
+    }
+    if (
+      !suspended &&
+      isErrorBoundaryFiber(node) &&
+      (node.flags & DidCapture) === 0
+    ) {
+      node.flags |= DidCapture; // 2
+      node.updateQueue = { error };
+      popProvidersAbove(node);
+      workInProgress = node;
+      return;
+    }
+    node = node.return;
+  }
+  throw error; // 4
+}
+
 function performUnitOfWork(unitOfWork: Fiber): void {
   const current = unitOfWork.alternate;
-  let next = beginWork(current, unitOfWork);
-  unitOfWork.memoizedProps = unitOfWork.pendingProps;
-  unitOfWork.lanes = removeLanes(unitOfWork.lanes, workInProgressRootRenderLanes);
-  // 本轮 renderLanes 对应的更新已在这个节点上处理完，清掉以免下一轮重复
-  if (next == null) {
-    completeUnitOfWork(unitOfWork);
-  } else {
-    workInProgress = next;
+  try {
+    const next = beginWork(current, unitOfWork, workInProgressRootRenderLanes);
+    unitOfWork.memoizedProps = unitOfWork.pendingProps;
+    unitOfWork.lanes = removeLanes(unitOfWork.lanes, workInProgressRootRenderLanes);
+    // 本轮 renderLanes 对应的更新已在这个节点上处理完，清掉以免下一轮重复
+    if (next == null) {
+      completeUnitOfWork(unitOfWork);
+    } else {
+      workInProgress = next;
+    }
+  } catch (error) {
+    unwindWork(unitOfWork, error);
   }
 }
 
@@ -361,7 +431,9 @@ function ensureRootIsScheduled(root: FiberRoot): void {
   }
 
   root.callbackPriority = newCallbackPriority;
-  root.callbackNode = unstable_scheduleCallback(NormalPriority, () => {
+  const schedulerPriority =
+    newCallbackPriority === TransitionLane ? LowPriority : NormalPriority;
+  root.callbackNode = unstable_scheduleCallback(schedulerPriority, () => {
     performConcurrentWorkOnRoot(root);
   });
   // DefaultLane：宏任务里可切片。task id 记在 callbackNode，方便被 Sync cancel

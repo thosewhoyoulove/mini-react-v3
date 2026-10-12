@@ -1,8 +1,14 @@
+import { popProvider } from './beginWork';
 import {
+  ContextProvider,
+  ForwardRef,
+  Fragment,
   FunctionComponent,
   HostComponent,
   HostRoot,
   HostText,
+  MemoComponent,
+  SuspenseComponent,
   type Fiber,
 } from './fiber';
 import { NoFlags, Update } from './fiberFlags';
@@ -43,7 +49,7 @@ function bubbleProperties(completedWork: Fiber): void {
     child = child.sibling;
   }
   completedWork.subtreeFlags |= subtreeFlags; // 3. Commit 可据此跳过无副作用子树
-  completedWork.childLanes = newChildLanes; // 3. 为后续 bailout 结构预留；当前尚未消费
+  completedWork.childLanes = newChildLanes; // 3. 下一轮 beginWork 用它判断子树还有没有工作
 }
 
 /**
@@ -140,6 +146,14 @@ export function completeWork(
       bubbleProperties(workInProgress); // 3
       return;
     }
+    case ContextProvider:
+      popProvider(workInProgress); // 子树已经读完 value，恢复外层 context
+      bubbleProperties(workInProgress);
+      return;
+    case Fragment:
+    case ForwardRef:
+    case MemoComponent:
+    case SuspenseComponent:
     case FunctionComponent:
     case HostRoot:
       bubbleProperties(workInProgress); // 4. 没有宿主实例，只汇总孩子

@@ -3,10 +3,12 @@ import {
   unstable_scheduleCallback,
 } from 'scheduler';
 import {
+  ForwardRef,
   FunctionComponent,
   HostComponent,
   HostRoot,
   HostText,
+  MemoComponent,
   type Fiber,
   type FiberRoot,
 } from './fiber';
@@ -17,6 +19,7 @@ import {
   Passive,
   PassiveMask,
   Placement,
+  Ref,
   Update,
 } from './fiberFlags';
 import { getHostConfig } from './hostContext';
@@ -160,7 +163,7 @@ function commitPlacement(finishedWork: Fiber): void {
 
 /** 深度优先执行被删除子树中的 Layout / Passive cleanup。 */
 function unmountEffects(fiber: Fiber): void {
-  if (fiber.tag === FunctionComponent) {
+  if (hasHookList(fiber)) {
     commitHookEffectListUnmount(fiber, HookLayout);
     commitHookEffectListUnmount(fiber, HookPassive);
     // 教学简化：卸载时两种 effect 的 destroy 都在 Mutation 里跑完，不把 Passive 留到绘制后
@@ -197,8 +200,66 @@ function commitHostUnmount(
   }
 }
 
-/** 删除一棵旧子树：先清理 Effect，再修改宿主树。 */
+/** 函数组件、memo、forwardRef 的 Hook 都挂在这个 Fiber 上。 */
+function hasHookList(fiber: Fiber): boolean {
+  return (
+    fiber.tag === FunctionComponent ||
+    fiber.tag === MemoComponent ||
+    fiber.tag === ForwardRef
+  );
+}
+
+/**
+ * 写入 ref。
+ *
+ * 1. 身份变了就先把旧 ref 清成 null
+ * 2. 宿主节点写真实实例；函数组件和 memo 写 Fiber 本身
+ * 3. 函数 ref 直接调用，对象 ref 写 current
+ */
+function commitAttachRef(finishedWork: Fiber): void {
+  const prevRef = finishedWork.alternate?.ref ?? null;
+  const nextRef = finishedWork.ref;
+  if (prevRef != null && !Object.is(prevRef, nextRef)) {
+    detachRef(prevRef); // 1
+  }
+  if (nextRef == null) {
+    return;
+  }
+  const instance =
+    finishedWork.tag === HostComponent || finishedWork.tag === HostText
+      ? finishedWork.stateNode
+      : finishedWork; // 2
+  if (typeof nextRef === 'function') {
+    nextRef(instance); // 3
+    return;
+  }
+  nextRef.current = instance; // 3
+}
+
+/** 卸载或换 ref 时把上一格清空。 */
+function detachRef(ref: any): void {
+  if (typeof ref === 'function') {
+    ref(null);
+    return;
+  }
+  ref.current = null;
+}
+
+/** 被删子树上的 ref 都要写成 null，包含没有 Ref flag 的旧节点。 */
+function detachRefs(fiber: Fiber): void {
+  if (fiber.ref != null) {
+    detachRef(fiber.ref);
+  }
+  let child = fiber.child;
+  while (child != null) {
+    detachRefs(child);
+    child = child.sibling;
+  }
+}
+
+/** 删除一棵旧子树：先清理 Effect 和 ref，再修改宿主树。 */
 function commitDeletion(deletedFiber: Fiber, nearestMountedAncestor: Fiber): void {
+  detachRefs(deletedFiber);
   unmountEffects(deletedFiber);
   const parentFiber = getHostParentFiber(nearestMountedAncestor);
   const isContainer = parentFiber.tag === HostRoot;
@@ -274,7 +335,7 @@ function commitMutationEffectsOnFiber(finishedWork: Fiber): void {
     finishedWork.flags &= ~Placement;
   }
   if ((flags & Update) !== 0) {
-    if (finishedWork.tag === FunctionComponent) {
+    if (hasHookList(finishedWork)) {
       commitHookEffectListUnmount(finishedWork, HookLayout | HookHasEffect);
       // 4. 函数组件的 Update = useLayoutEffect deps 变了：先跑 destroy
     } else {
@@ -286,11 +347,10 @@ function commitMutationEffectsOnFiber(finishedWork: Fiber): void {
 /**
  * Layout 阶段：DOM 已改、浏览器还没画，跑 useLayoutEffect 的 create。
  *
- * 只做两步：
- *   1. 子树带 LayoutMask（即 Update）→ 先递归孩子
- *   2. 自己是函数组件且带 Update → 跑 tag 匹配 HookLayout | HookHasEffect 的 create
- *
- * Host 节点的 Update 只在 Mutation 里改 DOM，这里看到会自然跳过。
+ * 只做三步：
+ *   1. 子树带 LayoutMask（Update 或 Ref）→ 先递归孩子
+ *   2. 带 Ref → 写入宿主实例或函数组件 Fiber；卸载路径另走 detachRefs
+ *   3. 函数组件 / memo / forwardRef 带 Update → 跑 useLayoutEffect create
  */
 function commitLayoutEffectsOnFiber(finishedWork: Fiber): void {
   if ((finishedWork.subtreeFlags & LayoutMask) !== 0) {
@@ -300,11 +360,11 @@ function commitLayoutEffectsOnFiber(finishedWork: Fiber): void {
       child = child.sibling;
     }
   }
-  if (
-    (finishedWork.flags & Update) !== 0 &&
-    finishedWork.tag === FunctionComponent
-  ) {
-    commitHookEffectListMount(finishedWork, HookLayout | HookHasEffect); // 2
+  if ((finishedWork.flags & Ref) !== 0) {
+    commitAttachRef(finishedWork); // 2
+  }
+  if ((finishedWork.flags & Update) !== 0 && hasHookList(finishedWork)) {
+    commitHookEffectListMount(finishedWork, HookLayout | HookHasEffect); // 3
   }
 }
 
@@ -319,7 +379,7 @@ function commitPassiveUnmountOnFiber(finishedWork: Fiber): void {
   }
   if (
     (finishedWork.flags & Passive) !== 0 &&
-    finishedWork.tag === FunctionComponent
+    hasHookList(finishedWork)
   ) {
     commitHookEffectListUnmount(finishedWork, HookPassive | HookHasEffect);
   }
@@ -336,7 +396,7 @@ function commitPassiveMountOnFiber(finishedWork: Fiber): void {
   }
   if (
     (finishedWork.flags & Passive) !== 0 &&
-    finishedWork.tag === FunctionComponent
+    hasHookList(finishedWork)
   ) {
     commitHookEffectListMount(finishedWork, HookPassive | HookHasEffect);
   }

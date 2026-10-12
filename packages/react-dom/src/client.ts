@@ -1,6 +1,6 @@
 import type { ReactElement } from 'react';
 import { createContainer, updateContainer } from 'react-reconciler';
-import { hostConfig } from './hostConfig';
+import { ensureRootClickDelegation, hostConfig } from './hostConfig';
 
 /**
  * ReactDOM 的根入口。
@@ -11,6 +11,7 @@ import { hostConfig } from './hostConfig';
 
 /** 创建可重复 render 的根；闭包中的 FiberRoot 在多次更新之间保持不变。 */
 export function createRoot(container: Element) {
+  ensureRootClickDelegation(container);
   const root = createContainer(container, hostConfig);
   return {
     render(element: ReactElement) {
