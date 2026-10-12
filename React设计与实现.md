@@ -2,7 +2,7 @@
 
 基于本仓库 **mini-react** 的教学讲稿。体例模仿《Vue.js 设计与实现》：按「篇 → 章 → 节」展开，对着源码讲清「为什么这样设计、代码里怎么落地」。
 
-本文件保留完整总目录，同时提供学习入口和面试短路径。每章正文在 [`docs/react-design/`](./docs/react-design/) 下独立成文；内容严格对齐仓库**已实现**路径，教学实现与官方 React 的差异、未实现能力见[附录](./docs/react-design/appendix.md)。
+本文件保留完整总目录，同时提供学习入口和面试短路径。每章正文从[第 1 章](./docs/react-design/01-声明式UI与命令式DOM的权衡.md)起独立成文；内容严格对齐仓库**已实现**路径，教学实现与官方 React 的差异、未实现能力见[附录](./docs/react-design/appendix.md)。
 
 ## 前置知识
 
@@ -17,7 +17,7 @@
 
 ### 系统学习
 
-按原总目录从第 1 章读到第 21 章：先建立声明式 UI、包边界和 Element，再依次进入 Fiber、Render / Commit、Diff、Hooks、Scheduler / Lane 与 HostConfig。每读完一篇，用 [`demos/hello-dom`](./demos/hello-dom/) 对照一次真实交互；最后用[附录的讲解路线](./docs/react-design/appendix.md#三档讲解路线)复述。
+按原总目录从第 1 章读到第 21 章：先建立声明式 UI、包边界和 Element，再依次进入 Fiber、Render / Commit、Diff、Hooks、Scheduler / Lane 与 HostConfig。每读完一篇，用 [`demos/hello-dom`](https://github.com/thosewhoyoulove/mini-react-v3/tree/main/demos/hello-dom) 对照一次真实交互；最后用[附录的讲解路线](./docs/react-design/appendix.md#三档讲解路线)复述。
 
 ### 面试速查
 

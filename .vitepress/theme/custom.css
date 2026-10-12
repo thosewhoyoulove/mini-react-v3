@@ -1,0 +1,28 @@
+@media (max-width: 768px) {
+  .vp-doc {
+    font-size: 17px;
+    line-height: 1.75;
+    padding-bottom: 32px;
+  }
+
+  .vp-doc h1 {
+    font-size: 1.65rem;
+    line-height: 1.35;
+  }
+
+  .vp-doc h2 {
+    font-size: 1.3rem;
+    margin-top: 1.6em;
+  }
+
+  .vp-doc pre {
+    margin-left: -16px;
+    margin-right: -16px;
+    border-radius: 0;
+    font-size: 13px;
+  }
+
+  .vp-doc .header-anchor {
+    display: none;
+  }
+}

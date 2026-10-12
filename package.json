@@ -7,10 +7,14 @@
   "scripts": {
     "build:demo": "pnpm --filter hello-dom build",
     "dev": "pnpm --filter hello-dom dev",
+    "docs:dev": "vitepress dev --host --port 5199",
+    "docs:build": "vitepress build",
+    "docs:preview": "vitepress preview --host --port 5199",
     "test": "pnpm --dir demos/hello-dom exec vite build --config ../../tests/vite.config.mjs --configLoader runner && node .test-dist/run.mjs",
     "typecheck": "tsc -b && tsc -p demos/hello-dom/tsconfig.json && tsc -p tests/tsconfig.json"
   },
   "devDependencies": {
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "vitepress": "^1.6.4"
   }
 }

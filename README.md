@@ -82,6 +82,12 @@ pnpm build:demo
 - Layout / Passive Effect 的更新与卸载时序
 - DOM 属性、布尔属性和事件监听器更新
 
+## 在手机上读讲稿
+
+同一 Wi-Fi 下执行 `pnpm docs:dev`，用手机浏览器打开终端里的 Network 地址。侧栏是全书目录，章节底部可以上一章、下一章。
+
+推送到 `main`，并在仓库 Settings → Pages 里把来源选成 GitHub Actions 之后，也可以打开 <https://thosewhoyoulove.github.io/mini-react-v3/>。
+
 ## 学习路径
 
 - 系统学习：从 [React设计与实现.md](./React设计与实现.md) 的 21 章目录开始
