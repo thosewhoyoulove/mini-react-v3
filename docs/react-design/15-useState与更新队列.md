@@ -8,9 +8,9 @@
 
 ## 本章书签
 
-- [15.1 setState 先入队，不直接改值](#151-setstate-先入队不直接改值)
+- [15.1 setState 先入队，不直接改值](#151-setstate-先入队，不直接改值)
 - [15.2 render 按顺序消费 state 与 reducer 队列](#152-render-按顺序消费-state-与-reducer-队列)
-- [15.3 Lane 决定何时调度，不筛选单条 Update](#153-lane-决定何时调度不筛选单条-update)
+- [15.3 Lane 决定何时调度，不筛选单条 Update](#153-lane-决定何时调度，不筛选单条-update)
 - [面试复习](#面试复习)
 
 ---

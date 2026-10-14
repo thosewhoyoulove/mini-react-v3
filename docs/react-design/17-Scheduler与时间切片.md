@@ -10,9 +10,9 @@
 
 ## 本章书签
 
-- [17.1 任务不是 FIFO：先比 `priorityLevel`，再比 `startTime`](#171-任务不是-fifo先比-prioritylevel再比-starttime)
-- [17.2 MessageChannel 如何承接任务，5ms 又如何形成时间片](#172-messagechannel-如何承接任务5ms-又如何形成时间片)
-- [17.3 `schedule/cancel`、调试同步边界与 Lane 的分工](#173-schedulecancel调试同步边界与-lane-的分工)
+- [17.1 任务不是 FIFO：先比 `priorityLevel`，再比 `startTime`](#171-任务不是-fifo：先比-prioritylevel，再比-starttime)
+- [17.2 MessageChannel 如何承接任务，5ms 又如何形成时间片](#172-messagechannel-如何承接任务，5ms-又如何形成时间片)
+- [17.3 `schedule/cancel`、调试同步边界与 Lane 的分工](#173-schedulecancel、调试同步边界与-lane-的分工)
 - [面试复习](#面试复习)
 
 ---

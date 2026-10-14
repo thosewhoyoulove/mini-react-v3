@@ -10,9 +10,9 @@
 
 ## 本章书签
 
-- [16.1 Render 只登记 Effect，为什么还需要两层标记](#161-render-只登记-effect为什么还需要两层标记)
-- [16.2 deps 如何决定 `HookHasEffect`，bailout 又跳过了什么](#162-deps-如何决定-hookhaseffectbailout-又跳过了什么)
-- [16.3 Commit 的真实时间线，以及 Passive 的保证边界](#163-commit-的真实时间线以及-passive-的保证边界)
+- [16.1 Render 只登记 Effect，为什么还需要两层标记](#161-render-只登记-effect，为什么还需要两层标记)
+- [16.2 deps 如何决定 `HookHasEffect`，bailout 又跳过了什么](#162-deps-如何决定-hookhaseffect，bailout-又跳过了什么)
+- [16.3 Commit 的真实时间线，以及 Passive 的保证边界](#163-commit-的真实时间线，以及-passive-的保证边界)
 - [面试复习](#面试复习)
 
 ---

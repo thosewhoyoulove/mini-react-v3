@@ -9,7 +9,7 @@
 ## 本章书签
 
 - [14.1 调用顺序就是 Hook 的身份](#141-调用顺序就是-hook-的身份)
-- [14.2 mount 新建链，update 对齐旧链](#142-mount-新建链update-对齐旧链)
+- [14.2 mount 新建链，update 对齐旧链](#142-mount-新建链，update-对齐旧链)
 - [14.3 Dispatcher 划定 Hook 的执行边界](#143-dispatcher-划定-hook-的执行边界)
 - [面试复习](#面试复习)
 

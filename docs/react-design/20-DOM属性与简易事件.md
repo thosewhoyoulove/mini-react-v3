@@ -46,7 +46,7 @@
 | 新 prop | 当前仓库的处理 |
 | --- | --- |
 | `className` | 写成 `class` attribute |
-| `style={{...}}` | `Object.assign(domElement.style, value)` |
+| `style` 对象 | `Object.assign(domElement.style, value)` |
 | `onXxx` | 进入事件分支 |
 | `null`、`undefined`、`false` | 删除 attribute |
 | `true` | 写入值为空字符串的 attribute |
