@@ -56,6 +56,8 @@ docs/react-design/
 
 ## 第二篇：描述 UI
 
+`createElement` 和 JSX 都只产生普通对象。这一篇把对象的字段走完，并说明运行时怎样认出它是一份合法描述。
+
 | 章 | 标题 | 状态 |
 | --- | --- | --- |
 | 4 | [ReactElement 与 `createElement`](./docs/react-design/04-ReactElement与createElement.md) | 已写 |
@@ -64,6 +66,8 @@ docs/react-design/
 ---
 
 ## 第三篇：渲染器
+
+描述从这里变成可以暂停的工作。第 6 章先建立链表和同一位置上的两格 Fiber，后面各章再向下走、向上完成、提交到 DOM。
 
 | 章 | 标题 | 状态 |
 | --- | --- | --- |

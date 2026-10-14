@@ -2,41 +2,49 @@
 
 [← 返回总目录](../../React设计与实现.md) · [上一章](./05-JSX与jsx-runtime与typeof.md) · [下一章 →](./07-副作用标记Flags.md)
 
-> 主文件：`packages/react-reconciler/src/fiber.ts`
-> Element 是嵌套对象树；Fiber 把同一棵树改成可暂停的链表。双缓冲保证屏幕上看不到半成品。
+---
+
+第 2 章的 `mount` 要等整棵子树都 `appendChild` 完才能返回，中间没有「下一个节点」可以保存。ReactElement 的孩子嵌在 `props.children` 里，正好是这种树。本章把它改成链表，并准备两格节点：一格对应当前屏幕，一格留给这一轮计算。flags、工作循环的代码留到后面几章，这里先把结构走通。
 
 ## 本章书签
 
-- [6.1 为什么 Element 树要变成 Fiber 链表](#61-为什么-element-树要变成-fiber-链表)
-- [6.2 Fiber 的 tag](#62-fiber-的-tag)
-- [6.3 `current` 与 `workInProgress`](#63-current-与-workinprogress)
-- [6.4 `createWorkInProgress`](#64-createworkinprogress)
+- [6.1 描述树为什么停不下来](#61-描述树为什么停不下来)
+- [6.2 三条指针怎么走完一棵小树](#62-三条指针怎么走完一棵小树)
+- [6.3 同一位置为什么有两格 Fiber](#63-同一位置为什么有两格-fiber)
 - [面试复习](#面试复习)
 
 ---
 
-## 6.1 为什么 Element 树要变成 Fiber 链表
+## 6.1 描述树为什么停不下来
 
-ReactElement 的孩子在 `props.children` 里，是树，不是「下一个节点」指针。若工作循环用递归直接走这棵树，一次 `beginWork` 会陷进整棵子树，切片无法停在「刚好做完某一个节点」。
+`packages/react-reconciler/src/fiber.ts` 文件头用了一棵很小的描述：
 
-Fiber 把同一份结构改成三条指针：
-
-```text
-child    → 第一个子节点
-sibling  → 下一个兄弟
-return   → 父节点（避开 JS 关键字 parent）
-```
-
-`fiber.ts` 文件头的例子：
-
-```ts
-createElement('div', null,
+```js
+createElement(
+  'div',
+  null,
   createElement('h1', null, 'Mini React'),
   createElement('p', null, 'count: 0'),
-)
+);
 ```
 
-链表长这样：
+作为 ReactElement，它是嵌套对象。`div` 的孩子是数组，`h1` 的孩子是字符串 `'Mini React'`。用递归去走，调用栈要等 `h1` 和它的文本都处理完，才会回到 `div` 再去看 `p`。想在「`h1` 做完了」这个时刻停下来，栈上没有一个变量指向 `p`。
+
+Fiber 把同一层关系写成三根指针：
+
+```text
+child    第一个子节点
+sibling  下一个兄弟
+return   父节点
+```
+
+父指针不叫 `parent`，是为了避开 JavaScript 的关键字。没有 `prevSibling`。要找前一个兄弟，只能从父节点的 `child` 再往后数。后面提交时寻找插入位置，也是顺着这条链走。
+
+工作循环每次只拿一个 Fiber。有 `child` 就走向孩子，没有就做完自己，再看 `sibling`，兄弟也没有就沿 `return` 回到父节点。停下来时，只要记住「下一个是谁」。这就是第 2 章说的可暂停：停在节点边界上，而不是停在一次递归的半中间。
+
+## 6.2 三条指针怎么走完一棵小树
+
+这棵描述对应的链表是：
 
 ```text
 HostRoot
@@ -51,120 +59,138 @@ h1 ──sibling──► p
 "Mini React"      "count: 0"
 ```
 
-工作循环每次只处理**一个** Fiber：有 `child` 就往下，没有就 `complete`，有 `sibling` 就横走。停下来时，全局 `workInProgress` 指向「下一个该处理的节点」，下一拍从这里续。这就是第 2 章说的「可中断」的数据结构前提。
+`HostRoot` 不来自任何 JSX。`createRoot` 时先放这一格，它的孩子才是 `render` 交进来的那棵描述。从 `div` 出发可以核对三根指针：`child` 是 `h1`，`h1.sibling` 是 `p`，`p.return` 回到 `div`。
 
-没有 `prevSibling`：要找上一个兄弟，只能从父的 `child` 往后走。Commit 找插入锚点（`getHostSibling`）也是顺着这条链。
+按「先孩子，再兄弟，再父节点」走一遍。这一顺序和第 8 章的工作循环相同，现在先当成人手移动的路线：
 
-## 6.2 Fiber 的 tag
+```text
+HostRoot → div → h1 → "Mini React"
+完成文本，完成 h1，下一个是 p
+p → "count: 0"
+完成文本，完成 p，回到 div，再回到 HostRoot
+```
 
-`tag` 决定 `beginWork` / `completeWork` / `commit` 走哪条分支。数字与官方对齐，方便对照：
+假如时间在完成 `"Mini React"` 之后用完，下一个要处理的是 `p`。把这个 Fiber 记下来，下一拍从 `p` 继续。`div` 还没做完，因为它的右兄弟还没走。屏幕上的 DOM 还不动：这条链是内存里的工作结构。
 
-| 常量 | 值 | 对应什么 |
+节点用 `tag` 区分种类，数字和官方源码对齐，方便以后对照。第一次读这棵树，认准四个就够：
+
+| tag | 值 | 这棵树上的谁 |
 | --- | --- | --- |
-| `FunctionComponent` | 0 | `createElement(App, null)`，`type` 是函数 |
-| `HostRoot` | 3 | `createRoot` 时创建，不对应任何 JSX |
-| `HostComponent` | 5 | `'div'` / `'button'` 等宿主标签 |
-| `HostText` | 6 | 文本，如 `'count: ' + count` |
+| `FunctionComponent` | 0 | `createElement(App, null)` 这种，`type` 是函数 |
+| `HostRoot` | 3 | `createRoot` 创建的根，没有对应标签 |
+| `HostComponent` | 5 | `'div'`、`'h1'`、`'p'` |
+| `HostText` | 6 | `'Mini React'`、`'count: 0'` |
 
-`createFiberFromElement` 的规则很短：`typeof type === 'function'` → 函数组件，否则当宿主标签。本仓库没有 Fragment / Portal / ClassComponent 等 tag，未知类型在 `beginWork` 里当叶子返回 `null`。
+文本不是 ReactElement，不会走 `createFiberFromElement`，而走 `createFiberFromText`。元素则按 `type` 选 tag：函数是 `FunctionComponent`，普通字符串是 `HostComponent`。`Fragment`、`Context.Provider`、`memo`、`forwardRef`、`Suspense` 也各有 tag，由同一个 `tagFromType` 识别。第 9 章按 tag 分发时再展开。认不出的 tag 在 `beginWork` 里当作叶子，返回 `null`。
 
-几个常对混的字段：
+其余字段先知道放什么，用到时再回来：
 
-| 字段 | 存什么 |
+| 字段 | 先记住的含义 |
 | --- | --- |
-| `stateNode` | Host → 真实 DOM；HostRoot → `FiberRoot`；函数组件一般为 `null` |
-| `pendingProps` | 这次刚传入的 props |
-| `memoizedProps` | 上次用过的 props，commit 时对比属性 |
-| `memoizedState` | 函数组件：Hook 链表头 |
-| `flags` / `subtreeFlags` | 自己 / 子树的副作用，第 7 章 |
-| `lanes` / `childLanes` | 自己 / 子树上未处理的更新优先级 |
+| `stateNode` | 宿主节点上的 DOM；`HostRoot` 上是 `FiberRoot`；函数组件这里一般是 `null` |
+| `pendingProps` | 这一轮新拿到的 props |
+| `memoizedProps` | 上一轮用过的 props |
+| `memoizedState` | 函数组件的 Hook 链表头，第 14 章 |
+| `flags` | 这个节点待提交的副作用，第 7 章 |
 
-整棵应用还有一个 **不是 Fiber** 的入口 `FiberRoot`：`containerInfo` 指向 `#root`，`current` 指向 HostRoot Fiber，`finishedWork` 指向算完待 commit 的 WIP 根。HostRoot 的 `stateNode` 反过来指这个 `FiberRoot`，所以从任意 Fiber 一路 `return` 都能找到根。
+整棵应用还有一个入口不在链表里。`FiberRoot` 的 `containerInfo` 指向页面上的 `#root`，`current` 指向那棵已经提交的 `HostRoot`。`HostRoot.stateNode` 指回这个 `FiberRoot`。从任意 Fiber 沿着 `return` 走到根，就能找到容器。
 
-## 6.3 `current` 与 `workInProgress`
+## 6.3 同一位置为什么有两格 Fiber
 
-双缓冲在节点上的名字叫 `alternate`：
+第 2 章的约束是：正在算的结构不能就是屏幕上那一棵。Fiber 用 `alternate` 把同一位置的两格连起来：
 
 ```text
 current.alternate        === workInProgress
 workInProgress.alternate === current
 ```
 
-- **current**：已经提交、屏幕上正在显示的那棵。
-- **workInProgress**：本轮 Render 正在算的那棵。Diff、打 flags、创建尚未插入的实例，都发生在这里。
-- **commit 成功**：`root.current = finishedWork`，角色对调。刚才的 WIP 变成新 current；下一次更新把旧 current 那一格拿来当新 WIP。
+`current` 对应当前已经提交的界面。`workInProgress` 是这一轮正在写的那一格。比较、打标记、创建还没插进文档的实例，都落在后者。提交成功后，`commitWork.ts` 里执行 `root.current = finishedWork`。刚才算完的那一格变成新的 `current`，原先的 `current` 留到下一轮当新的工作格。
 
-屏幕永远看不到半成品树。切片暂停只停 WIP 指针，current 与真实 DOM 仍是上一轮完整提交的结果。
+因此一个位置上是两格可以反复使用的 Fiber，不是每点一次按钮就新建一整棵，也不是内存里有两套 DOM。`stateNode` 上的 DOM 节点会跟着被复用的那一格走。
 
-`setState` 闭包里抓到的 Fiber 可能是两棵里的任意一棵，所以 `markUpdateLaneFromFiberToRoot` 给 `fiber` 和 `fiber.alternate` 都标 lane。
+配对的函数是 `createWorkInProgress`。它不负责把整棵树克隆一遍，只处理「当前这一格」：
 
-## 6.4 `createWorkInProgress`
+```ts
+export function createWorkInProgress(current: Fiber, pendingProps: any): Fiber {
+  let wip = current.alternate;
+  if (wip == null) {
+    wip = createFiber(current.tag, pendingProps, current.key);
+    wip.type = current.type;
+    wip.stateNode = current.stateNode;
+    wip.alternate = current;
+    current.alternate = wip; // 1. 还没有另一格：新建并互相指向
+  } else {
+    wip.pendingProps = pendingProps;
+    wip.flags = NoFlags;
+    wip.subtreeFlags = NoFlags;
+    wip.deletions = null; // 2. 沿用另一格，清掉上一轮的副作用
+  }
 
-为 current 上的某个节点取出（或新建）对应的 WIP：
-
-**第一次还没有 `alternate`：**
-
-1. `createFiber` 复制 `tag` / `key` / `type` / `stateNode`。
-2. `wip.alternate = current`，`current.alternate = wip`，两棵树互相指。
-
-**之后每次更新：**
-
-1. 复用同一格 `wip`，只改 `pendingProps`。
-2. 清空 `flags` / `subtreeFlags` / `deletions`，避免上次副作用残留。
-3. **不再 new 一整棵。**
-
-无论哪条路，都会先把 `child` / `memoizedState` / `updateQueue` 等从 current 拷过来。子树没变时可以直接复用旧 child 链表；变了再由 `reconcileChildFibers` 重新接。`return` 先置 `null`，挂回树时再接。
-
-```text
-第一次更新：current ──alternate──► 新 wip
-之后更新：  复用那格 wip，只重置 flags
-commit：    root.current = finishedWork，两棵对调
+  wip.type = current.type;
+  wip.child = current.child; // 3. 先沿用 current 的孩子
+  wip.memoizedProps = current.memoizedProps;
+  wip.memoizedState = current.memoizedState;
+  wip.updateQueue = current.updateQueue;
+  wip.sibling = current.sibling;
+  wip.index = current.index;
+  wip.lanes = current.lanes;
+  wip.childLanes = current.childLanes;
+  wip.ref = current.ref;
+  wip.dependencies = current.dependencies;
+  wip.return = null; // 3. 还没挂回父节点，接上链表时再写
+  return wip;
+}
 ```
 
-下一章讲这些节点上的 `flags`：Render 为什么不直接改 DOM，只打标记。
+两条路径的差别是：
+
+1. **另一格还不存在。** 按 `tag` / `key` 新建，抄上 `type` 和 `stateNode`，两格互相指向。`createContainer` 先放了一个空的 `HostRoot` 作为 `current`。第一次 `render` 时 `prepareFreshStack` 对它调用这个函数，根上的两格就配好了。
+2. **另一格已经在。** 不新建。写上这次的 `pendingProps`，把 `flags`、`subtreeFlags`、`deletions` 清掉，避免上一轮的「要插入」「要删除」残留到这一轮。
+3. **两条路径最后都从 `current` 抄状态。** `child` 先指向 `current` 的孩子。孩子没变时，这条链可以继续用；变了，调和时再换成新的 `child`。`memoizedState` 先抄过来，函数组件里的 Hook 链表才不会丢。`return` 先写成 `null`，因为这一格还没决定挂到哪个父节点下面。
+
+子节点的出生时间和根不一样。第一次渲染时，`h1`、文本这些 Fiber 由 `createFiberFromElement` / `createFiberFromText` 新建，`alternate` 仍是 `null`。下一次更新再走到它们，才进入上面的第 1 步，配上第二格。之后就一直是这两格交换角色。
+
+半成品停在 `workInProgress` 上。这一轮如果被丢掉，`current` 仍是上次提交的结果，屏幕保持完整。怎样丢掉、从哪一格重新开始，等调度那一篇再看。下一章先看这些节点上的 `flags`：计算阶段为什么只打标记，不直接改 DOM。
 
 ## 面试复习
 
 ### 一句话结论
 
-Fiber 把不可暂停的递归树遍历改造成可保存进度的链式工作单元，双缓冲则让计算中的 WIP 与已提交的 current 分离。
+Fiber 用 `child` / `sibling` / `return` 把一次递归遍历变成可以在节点之间停下的链表。`alternate` 连接同一位置的两格，让正在计算的那一格和已经显示的那一格分开。
 
 ### 面试回答
 
-为什么 React 需要 Fiber？递归遍历依赖 JS 调用栈，一旦进入整棵子树，框架难以在节点边界暂停、恢复或放弃。Fiber 用 `child/sibling/return` 显式表达深度优先遍历，并把 props、state、lanes、flags 等工作状态挂在节点上；工作循环只需保留 `workInProgress` 就能续跑。为了不污染已提交结果，每个可复用节点通过 `alternate` 连接 current 与 WIP：Render 修改 WIP，完成后 Commit 更新宿主并令 `root.current = finishedWork`。本仓库的 `createWorkInProgress` 首次创建 alternate，之后复用并重置副作用字段。官方 Fiber 字段、bailout、并发恢复和错误边界更复杂；教学版还是单根、有限 tag 和两档 Lane，双缓冲也不意味着永远同时存在两棵结构完整且完全独立的树。
+ReactElement 的孩子嵌在 `props.children` 里。递归走进去之后，必须等子树返回才知道下一个兄弟是谁，所以无法在节点边界暂停。Fiber 把第一个孩子、下一个兄弟和父节点写成指针。做完 `h1` 的文本，下一个可以明确是 `p`。为了暂停时不改屏幕，每个位置保留两格，用 `alternate` 互指。`createWorkInProgress` 第一次新建另一格，之后复用并清掉副作用标记，再从 `current` 抄来孩子和 Hook 状态。提交时把 `root.current` 换成刚算完的那一格。DOM 只有提交过的那一份，函数组件本身也没有对应的 DOM 节点。
 
 ### 常见追问
 
-**1. 三个指针怎样模拟递归？**
+**1. 三根指针怎样代替递归？**
 
-有 child 就下钻；无 child 就完成当前节点，找到 sibling 则横移，否则沿 return 上升，等价于递归的调用与返回顺序。
+有 `child` 就往下。没有就完成当前节点，有 `sibling` 就横着走，否则沿 `return` 向上。这和函数调用进去、返回、再执行下一句的顺序一致，只是进度写在指针上。
 
-**2. `alternate` 是旧节点的备份吗？**
+**2. `alternate` 是上一帧的快照吗？**
 
-更准确地说，它连接同一逻辑位置的两份 Fiber 工作槽位；Commit 后 current/WIP 角色互换，并非每次都复制一份永久快照。
+它是同一位置的另一格工作槽。提交之后两格交换「谁是 current」。下一次更新复用原来的那一格，不是再复制一棵永久留存的树。
 
-**3. 双缓冲为什么能支持丢弃工作？**
+**3. 第一帧是不是每个节点都已经有两格？**
 
-未提交计算主要留在 WIP，current 仍代表上次完成结果；高优更新可重新从 current 准备 WIP，而不把半成品当成已提交状态。
+不是。`HostRoot` 在 `createRoot` 时就有一格，第一次 render 给它配对。孩子在第一次调和时新建，`alternate` 还是 `null`，下一次更新才配对。
 
-**4. Fiber 节点和 DOM 节点是一一对应吗？**
+**4. Fiber 和 DOM 一一对应吗？**
 
-不是。HostComponent/HostText 通常有 DOM `stateNode`，FunctionComponent 没有对应 DOM，HostRoot 对应的是 FiberRoot。
+宿主标签和文本通常有 `stateNode`。函数组件、Fragment 没有自己的 DOM 节点。`HostRoot` 的 `stateNode` 是 `FiberRoot`，容器在 `FiberRoot.containerInfo`。
 
 ### 容易说错
 
-- 不要说 Fiber 本身就是线程或协程；它是可调度工作的数据结构，执行仍发生在 JS 主线程。
-- 不要说双缓冲复制两套 DOM；成对的主要是 Fiber，DOM 副作用在 Commit 才落实。
-- 不要说 WIP 与 current 始终完全隔离；教学版会复制并复用部分字段、child 指针和 `stateNode`。
-- 不要把 `alternate` 理解成固定“旧树”；Commit 后两侧角色会交换。
+- Fiber 是主线程上的数据结构。它让遍历可以暂停，自己不是一条线程。
+- 两格 Fiber 不是两套 DOM。还没提交的修改留在工作格上。
+- `current` 和 `workInProgress` 会交换。`alternate` 并不固定指向「旧的那棵」。
 
 ### 源码入口
 
-- `packages/react-reconciler/src/fiber.ts`：Fiber/FiberRoot 字段与 `createWorkInProgress`。
-- `packages/react-reconciler/src/workLoop.ts`：`workInProgress` 游标与深度优先循环。
-- `packages/react-reconciler/src/childFiber.ts`：child/sibling/return 链表的构建与复用。
-- `packages/react-reconciler/src/completeWork.ts`：回溯阶段创建实例并冒泡信息。
-- `packages/react-reconciler/src/scheduleUpdate.ts`：更新进入工作循环的转发入口。
+- `packages/react-reconciler/src/fiber.ts`：三根指针、`createWorkInProgress`、`createFiberFromElement`。
+- `packages/react-reconciler/src/workLoop.ts`：`prepareFreshStack` 给根配对。
+- `packages/react-reconciler/src/commitWork.ts`：`root.current = finishedWork`。
 
 ---
 
