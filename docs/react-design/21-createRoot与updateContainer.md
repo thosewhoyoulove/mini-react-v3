@@ -1,24 +1,35 @@
-# 第 21 章：`createRoot` / `updateContainer` 入口
+# 第 21 章：`createRoot` 与 `updateContainer`
 
 [← 返回总目录](../../React设计与实现.md) · [上一章](./20-DOM属性与简易事件.md) · [下一章：附录 →](./appendix.md)
 
+为什么 `createRoot(container)` 不会立刻显示内容，而 `.render(element)` 才启动更新？第一次渲染明明还没有应用节点，为什么源码里已经存在 `current`？理解这两个问题，就能把公开 API、HostRoot、调度器和上一章的 DOM 操作接成一条完整路径。
+
 > 主文件：`packages/react-dom/src/client.ts`、`packages/react-reconciler/src/workLoop.ts`
-> 应用只看见 `createRoot(container).render(element)`。里面建的是 FiberRoot + HostRoot，更新一律走进工作循环。
 
 ## 本章书签
 
-- [21.1 `createRoot(container)`](#211-createrootcontainer)
-- [21.2 `render` → `updateContainer`](#212-render--updatecontainer)
-- [21.3 挂载与更新同一套路径](#213-挂载与更新同一套路径)
+- [21.1 `createRoot` 先建立什么](#211-createroot-先建立什么)
+- [21.2 `updateContainer` 怎样启动首次渲染](#212-updatecontainer-怎样启动首次渲染)
+- [21.3 后续更新、多根与官方实现的边界](#213-后续更新、多根与官方实现的边界)
 - [面试复习](#面试复习)
 
 ---
 
-## 21.1 `createRoot(container)`
+## 21.1 `createRoot` 先建立什么
+
+最小入口只有两句：
+
+```tsx
+const root = createRoot(document.getElementById('root')!);
+root.render(<h1>Hello</h1>);
+```
+
+第一句建立可复用的根，第二句才提交 React element。当前仓库的完整 `createRoot` 是：
 
 ```ts
 // packages/react-dom/src/client.ts
 export function createRoot(container: Element) {
+  ensureRootClickDelegation(container);
   const root = createContainer(container, hostConfig);
   return {
     render(element: ReactElement) {
@@ -28,12 +39,17 @@ export function createRoot(container: Element) {
 }
 ```
 
-`createContainer` 只建数据结构，**不调度、不改 DOM**：
+这里先做两件互不替代的事：
+
+1. `ensureRootClickDelegation(container)` 在容器上建立一次 `click` 委托。第二十章中节点的 `onClick` 只有这时才有统一入口。
+2. `createContainer(container, hostConfig)` 建立调和器的根数据结构，但不安排 Render，也不修改 DOM。
+
+`createContainer` 的核心可以缩成下面这样：
 
 ```ts
-const uninitializedFiber = createHostRootFiber(); // tag = HostRoot，还没有孩子
+const uninitializedFiber = createHostRootFiber();
 const root: FiberRoot = {
-  containerInfo,          // 真实 DOM，一般是 #root
+  containerInfo,
   current: uninitializedFiber,
   hostConfig,
   finishedWork: null,
@@ -41,129 +57,124 @@ const root: FiberRoot = {
   callbackNode: null,
   callbackPriority: NoLane,
 };
-uninitializedFiber.stateNode = root; // HostRoot ↔ FiberRoot 互相指
+
+uninitializedFiber.stateNode = root;
 ```
 
-此时屏幕上还是空容器。`current` 是一棵只有根的树，`alternate` 为 `null`。第一次 `render` 才会 `createWorkInProgress` 建出配对的 WIP。
+这里有两个名字容易混淆：
 
-兼容入口 `render(element, container)` 等于 `createRoot(container).render(element)`，每次都新开一个 root，教学 demo 只用 `createRoot`。
+- `FiberRoot` 是整棵应用的管理对象，保存真实容器、当前树和调度状态；
+- `HostRoot Fiber` 是 Fiber 树最上方的节点，参与 begin/complete/commit。
 
-## 21.2 `render` → `updateContainer`
+它们互相连接：`root.current` 指向 HostRoot，HostRoot 的 `stateNode` 又指回 `root`。
+
+因此，首次 `.render()` **不是没有 current**。`createContainer` 已经创建了 current HostRoot，只是 `current.child === null`，下面还没有应用树；它的 `alternate` 也还没有建立。第一次工作开始时，`prepareFreshStack` 才用 `createWorkInProgress(current, ...)` 创建配对的 WIP HostRoot。
+
+文件中的兼容入口 `render(element, container)` 只是 `createRoot(container).render(element)` 的包装。每调用一次它都会新建根；要在同一容器上重复渲染，应保留 `createRoot` 返回的对象并重复调用它的 `render`。
+
+## 21.2 `updateContainer` 怎样启动首次渲染
+
+`.render(element)` 闭包持有刚才的 `FiberRoot`，并调用：
 
 ```ts
-export function updateContainer(element: unknown, container: FiberRoot): void {
+export function updateContainer(
+  element: unknown,
+  container: FiberRoot,
+): void {
   container.current.pendingProps = { children: element };
   scheduleUpdateOnFiberImpl(container.current, SyncLane);
 }
 ```
 
-两步：
+这段代码只有两个动作。
 
-1. 把要渲染的 element 挂到 HostRoot 的 `pendingProps.children`。`beginWork` 的 `updateHostRoot` 就从这里取孩子。
-2. 对 HostRoot 打 **`SyncLane`**，走微任务里的 `workLoopSync`。首屏必须尽快画完，不能切片画一半。
+第一，把 element 放入 current HostRoot 的 `pendingProps.children`。工作循环开始后，`beginWork` 按 `HostRoot` 分支进入 `updateHostRoot`，再把这个 children 交给 `reconcileChildren`。
 
-之后就是第 8、18 章的路径：
+第二，在 HostRoot 上调度固定的 **`SyncLane`**。这里没有根据调用现场选择 Lane；在当前仓库中，每次 `root.render(...)` 都走 SyncLane。Sync 工作被合并进微任务，微任务执行时用 `workLoopSync` 一次完成本轮 Fiber 遍历，不经过 `shouldYield` 切片。
+
+完整主线如下：
 
 ```text
-ensureRootIsScheduled
+root.render(element)
+  → updateContainer：写 HostRoot.pendingProps.children
+  → scheduleUpdateOnFiberImpl(HostRoot, SyncLane)
+  → root.pendingLanes 合入 SyncLane
+  → ensureRootIsScheduled
   → queueMicrotask
-  → prepareFreshStack（从 current 克隆 WIP）
-  → workLoopSync：begin / complete 整棵
-  → commitRoot：Placement 把对应宿主节点插进 containerInfo
+  → prepareFreshStack：current HostRoot → WIP HostRoot
+  → workLoopSync：beginWork 向下，completeWork 向上
+  → commitRoot：Mutation 改 DOM，切换 current，Layout 写 ref / 跑 effect
 ```
 
-`setState` 不会再进 `updateContainer`。它从函数组件 Fiber 标 `DefaultLane`，约的是 Scheduler 宏任务。入口不同，后面的 begin / Diff / complete / commit 是同一套。
+首次进入 `updateHostRoot` 时，参数 `current` 是那个已经存在的 HostRoot，而 `current.child` 才是 `null`。调和器据此创建第一个应用 Fiber，并记录需要插入的节点。`completeWork` 在内存中创建、组装 DOM；Commit 的 Placement 最终把顶层宿主节点插入 `root.containerInfo`。
 
-## 21.3 挂载与更新同一套路径
-
-第一次 `render` 与之后再 `render`（或 `setState`）没有第二套「mount 专用协调器」。差别只在数据：
-
-| | 首次 `root.render` | 之后 `setState` / 再 `render` |
-| --- | --- | --- |
-| HostRoot.current.child | `null` | 已有应用树 |
-| HostRoot 的 Diff | `reconcileChildFibers(null, nextChildren)` | `reconcileChildFibers(current.child, nextChildren)` |
-| 新建后代的 Diff | 从首个新建 Fiber 往下走 `mountChildFibers` | 新建分支走 mount，复用分支走 reconcile |
-| Placement | 首个应用 Fiber会打标，其新建后代通常不逐个打标 | 新增或移动的节点打标 |
-| 实例 | `completeWork` 创建并 `appendAllChildren` | 复用，props 变了打 Update |
-| 进文档 | Commit 从带 Placement 的 Fiber 找到顶层宿主节点并插入 `#root` | 按 flags 插 / 移 / 删 / 改 |
-| Lane | `SyncLane` | `setState` 为 `DefaultLane`；再 `render` 仍是 Sync |
-
-所以「挂载」不是从 HostRoot 开始整棵切到另一套算法。首次边界要分两层看：
+所以不能把首次渲染描述成“从一棵完全不存在的 current 树开始”。更准确的图是：
 
 ```text
-prepareFreshStack
-  current HostRoot
-    ↕ alternate
-  workInProgress HostRoot
-
-HostRoot.beginWork
-  current != null、current.child == null
-  → reconcileChildFibers(true)
-  → 创建 App，App.flags |= Placement
-
-App.beginWork
-  current = App.alternate = null
-  → mountChildFibers(false)
-  → 新建后代，不逐个记录 Placement
+FiberRoot
+  └─ current HostRoot（已存在，child = null）
+          ⇅ 第一次 prepareFreshStack 建立 alternate
+     WIP HostRoot
+          └─ 新应用 Fiber → 新宿主节点
 ```
 
-`completeWork` 会创建宿主实例并离线组装宿主子树。Commit 处理 App 的 `Placement` 时，若 App 是函数组件，就递归找到它下面的顶层 Host 节点并插入容器；不能把这件事机械概括成「Commit 只插最外层 Fiber」，因为最外层 Fiber可能没有 DOM，也可能覆盖多个顶层宿主节点。
+## 21.3 后续更新、多根与官方实现的边界
 
-对着 demo 收束全书最小闭环：
+同一个 root 再次渲染时，仍然调用 `updateContainer`：
 
-```text
-createRoot(#root)
-  → createElement(App, null)
-  → updateContainer + SyncLane
-  → App() 跑起来，StateDemo 的 useState(0) mount
-  → 文本「count: 0」上屏
-点 +1
-  → setCount → DefaultLane
-  → StateDemo() 再跑，updateState 得到 1
-  → 文本 Fiber 复用，打 Update
-  → commitTextUpdate
+```tsx
+root.render(<h1>Hello</h1>);
+root.render(<h1>Welcome</h1>);
 ```
 
-未实现的能力（Fragment、合成事件、完整 Lane…）见附录 C。能把这条路径对着源码走通，教学版的目标就达到了。
+第二次只是覆盖当时 current HostRoot 的 `pendingProps.children`，再调度一次 SyncLane。此时 `current.child` 已指向已提交的应用树，调和器会尽量复用 Fiber 和 DOM，只对变化打 Placement、Update 或 Deletion 标记。
 
----
+组件里的 `setState` 则**不经过 `updateContainer`**：
+
+```tsx
+function Counter() {
+  const [count, setCount] = useState(0);
+  return <button onClick={() => setCount(count + 1)}>{count}</button>;
+}
+```
+
+调用 `setCount` 时，Hook 把更新放进自身队列，从对应的函数组件 Fiber 向 HostRoot 标记 Lane，然后直接进入 `scheduleUpdateOnFiberImpl`。它与 `root.render` 的入口和 Lane 来源不同，但后面共享 `ensureRootIsScheduled → begin/complete → commit` 这套工作循环。
+
+当前仓库还做了重要的教学简化：
+
+- `updateContainer` 直接改 HostRoot 的 `pendingProps`，并固定使用 SyncLane；
+- 官方 React 会把根更新放入更新队列，由更完整的事件优先级、Lane 与根调度逻辑处理；
+- 当前仓库已经有 `FiberRoot.hostConfig`，执行根工作时也会重新设置它，但工作循环和宿主上下文仍保留多个**模块级全局变量**。
+
+最后一点意味着多 root 隔离并不完整。例如 `currentRoot` 是找不到 HostRoot 时的全局兜底，`workInProgress`、`workInProgressRoot`、`syncRoot` 和 `syncScheduled` 也由所有根共享；`setHostConfig` 保存的当前 HostConfig 同样是模块级状态。连续建立根会改写这些全局指针，同一轮中多个根的同步任务也可能互相覆盖。这个实现适合讲清单根工作流，不能据此推断它具有官方 React 的多根并发隔离能力。
+
+这也是阅读教学源码时应保持的边界：数据结构保留了官方设计的主线，但调度细节不是生产实现的等价替代。
 
 ## 面试复习
 
-### 一句话结论
+**一句话：** `createRoot` 建 click 委托、FiberRoot 和空的 current HostRoot；`updateContainer` 写入根 children，并固定用 SyncLane 启动工作循环。
 
-`createRoot` 只建立 FiberRoot 与 current HostRoot；`render` 把 element 写入 HostRoot 并调度 SyncLane，首次根层仍走可跟踪副作用的 reconcile。
+**Q：首次渲染时有 current 吗？**
 
-### 面试回答（可口述，为什么→机制→仓库落点→官方差异）
+A：有。current HostRoot 已存在，只是 `current.child === null`；第一次 Render 才创建它的 WIP alternate 和应用子树。
 
-为什么入口要拆成 `createRoot` 和 `render`：容器与调度根可以长期复用，多次更新只替换根 children。机制上，`createContainer` 建 FiberRoot/current HostRoot 并保存 HostConfig；`updateContainer` 写 `pendingProps.children`、标 SyncLane，随后从 current HostRoot 克隆 WIP，走 begin/complete/commit。仓库落点是 `react-dom/src/client.ts` 与 `react-reconciler/src/workLoop.ts`。官方根更新通过 update queue、event priority 和更完整的 root scheduler 进入，本仓库直接改 `pendingProps`，并将 `root.render` 固定为 SyncLane。
+**Q：`setState` 会调用 `updateContainer` 吗？**
 
-### 常见追问
+A：不会。Hook 更新从组件 Fiber 直接标 Lane 并调度，只在后半段与根更新共享工作循环。
 
-**Q：`createRoot` 调用后为什么页面还没变化？**
-A：它只建立根数据结构，没有 element，也没有调度 Render/Commit。
+**Q：为什么当前仓库不能证明多 root 已完整支持？**
 
-**Q：首次 HostRoot 为什么有 current？**
-A：`createContainer` 已创建 current HostRoot；首次工作开始时 `createWorkInProgress` 为它建立 alternate。
-
-**Q：首次应用 Fiber上的 Placement 如何插入函数组件下的 DOM？**
-A：`commitPlacement` 找宿主父节点，`insertOrAppendPlacementNode` 跨过无实例 Fiber，插入其顶层宿主后代。
-
-**Q：`setState` 也会调用 `updateContainer` 吗？**
-A：不会。它从对应函数组件 Fiber 标 lane 并调度，但后续共享同一工作循环。
-
-### 容易说错
-
-- 错：首次 HostRoot 因 `current.child == null` 走 mount。对：判断的是 HostRoot 的 `current`，它存在。
-- 错：首次整棵树都没有 Placement。对：首个应用 Fiber会有 Placement。
-- 错：`root.render` 每次重建 FiberRoot。对：同一个 root 的 `render` 复用 FiberRoot；只有兼容 `render` 包装每次新建 root。
+A：多个调度游标、同步根指针和当前 HostConfig 仍是模块级全局状态，根之间可能相互覆盖。
 
 ### 源码入口
 
-- `packages/react-dom/src/client.ts`
+- `packages/react-dom/src/client.ts`：`createRoot`、`render`
+- `packages/react-dom/src/hostConfig.ts`：`ensureRootClickDelegation`
 - `packages/react-reconciler/src/workLoop.ts`：`createContainer`、`updateContainer`
-- `packages/react-reconciler/src/workLoop.ts`：`prepareFreshStack`、`performSyncWorkOnRoot`
-- `packages/react-reconciler/src/fiber.ts`：`createHostRootFiber`、`createWorkInProgress`
-- `packages/react-reconciler/src/commitWork.ts`：`commitPlacement`
+- `packages/react-reconciler/src/workLoop.ts`：`prepareFreshStack`、`ensureRootIsScheduled`
+- `packages/react-reconciler/src/beginWork.ts`：`updateHostRoot`
+- `packages/react-reconciler/src/commitWork.ts`：`commitRoot`、`commitPlacement`
+
+---
 
 [← 返回总目录](../../React设计与实现.md) · [上一章](./20-DOM属性与简易事件.md) · [下一章：附录 →](./appendix.md)

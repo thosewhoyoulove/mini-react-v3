@@ -30,7 +30,7 @@
 - **Render / Commit**：[第 8 章工作循环](./docs/react-design/08-工作循环.md) → [第 9 章 `beginWork`](./docs/react-design/09-beginWork按tag分发.md) → [第 11 章 `completeWork`](./docs/react-design/11-completeWork.md) → [第 12 章 Commit](./docs/react-design/12-Commit三阶段.md)
 - **Diff**：[第 10 章单节点与 keyed 列表](./docs/react-design/10-子节点Diff.md)
 - **Hooks**：[第 13 章函数组件](./docs/react-design/13-函数组件的执行时机.md) → [第 14 章 Hook 链表](./docs/react-design/14-Hook链表与Dispatcher.md) → [第 15 章 `useState`](./docs/react-design/15-useState与更新队列.md) → [第 16 章两种 Effect](./docs/react-design/16-useEffect与useLayoutEffect.md)
-- **Scheduler / Lane**：[第 17 章时间切片](./docs/react-design/17-Scheduler与时间切片.md) → [第 18 章两档 Lane](./docs/react-design/18-最小Lane.md)
+- **Scheduler / Lane**：[第 17 章时间切片](./docs/react-design/17-Scheduler与时间切片.md) → [第 18 章三档 Lane](./docs/react-design/18-最小Lane.md)
 - **HostConfig**：[第 19 章宿主抽象](./docs/react-design/19-HostConfig抽象.md) → [第 20 章 DOM 实现](./docs/react-design/20-DOM属性与简易事件.md) → [第 21 章根入口](./docs/react-design/21-createRoot与updateContainer.md)
 
 ```text
@@ -85,8 +85,8 @@ docs/react-design/
 
 | 章 | 标题 | 状态 |
 | --- | --- | --- |
-| 13 | [函数组件的执行时机](./docs/react-design/13-函数组件的执行时机.md) | 已写 |
-| 14 | [Hook 链表与 mount / update 两套 Dispatcher](./docs/react-design/14-Hook链表与Dispatcher.md) | 已写 |
+| 13 | [函数组件什么时候执行](./docs/react-design/13-函数组件的执行时机.md) | 已写 |
+| 14 | [Hook 链表与 Dispatcher](./docs/react-design/14-Hook链表与Dispatcher.md) | 已写 |
 | 15 | [`useState` 与更新队列](./docs/react-design/15-useState与更新队列.md) | 已写 |
 | 16 | [`useEffect` 与 `useLayoutEffect`](./docs/react-design/16-useEffect与useLayoutEffect.md) | 已写 |
 
@@ -97,7 +97,7 @@ docs/react-design/
 | 章 | 标题 | 状态 |
 | --- | --- | --- |
 | 17 | [Scheduler 与时间切片](./docs/react-design/17-Scheduler与时间切片.md) | 已写 |
-| 18 | [最小 Lane：SyncLane 与 DefaultLane](./docs/react-design/18-最小Lane.md) | 已写 |
+| 18 | [最小 Lane：三档更新怎样排队](./docs/react-design/18-最小Lane.md) | 已写 |
 
 ---
 
@@ -105,9 +105,9 @@ docs/react-design/
 
 | 章 | 标题 | 状态 |
 | --- | --- | --- |
-| 19 | [HostConfig 抽象](./docs/react-design/19-HostConfig抽象.md) | 已写 |
-| 20 | [DOM 属性更新与简易 `onXxx` 事件](./docs/react-design/20-DOM属性与简易事件.md) | 已写 |
-| 21 | [`createRoot` / `updateContainer` 入口](./docs/react-design/21-createRoot与updateContainer.md) | 已写 |
+| 19 | [HostConfig：让 reconciler 不认识 `document`](./docs/react-design/19-HostConfig抽象.md) | 已写 |
+| 20 | [DOM 属性更新与简易事件](./docs/react-design/20-DOM属性与简易事件.md) | 已写 |
+| 21 | [`createRoot` 与 `updateContainer`](./docs/react-design/21-createRoot与updateContainer.md) | 已写 |
 
 ---
 

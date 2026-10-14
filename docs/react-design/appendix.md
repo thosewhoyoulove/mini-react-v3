@@ -22,11 +22,11 @@
 
 1. JSX 编译后得到 ReactElement；它是 UI 描述，不是 DOM。
 2. Reconciler 把 Element 调和成由 `child / sibling / return` 串起的 Fiber 工作单元。
-3. 更新先进入 Lane；`SyncLane` 走微任务同步完成，`DefaultLane` 交给 Scheduler 分片。
+3. 更新先进入 Lane；`SyncLane` 走微任务同步完成，`DefaultLane` / `TransitionLane` 交给 Scheduler 分片。
 4. Render 在 work-in-progress 树上执行函数组件、处理 Hook 队列并 Diff 子节点，只创建离屏实例和记录 Flags，不修改已挂载的 DOM 树。
 5. Commit 同步处理删除、插入和更新，切换 `root.current`，执行 Layout Effect；Passive Effect 延后。
 
-口述后用一句边界收尾：这是本仓库的两档 Lane、FIFO Scheduler 和精简 HostConfig，不是官方 React 的完整实现。
+口述后用一句边界收尾：这是本仓库的三档 Lane、优先级最小堆和精简 HostConfig，不是官方 React 的完整实现。
 
 ### 10 分钟：主线加三个高频问题
 
@@ -66,8 +66,8 @@
 | Flag | 单个 Fiber 本轮要提交的副作用位，如 `Placement / Update / ChildDeletion / Passive`。 |
 | `subtreeFlags` | 子树 Flags 的汇总，让 Commit 能跳过无副作用子树。 |
 | Hook 链表 | 函数组件 Fiber 的 `memoizedState` 指向的顺序链表。 |
-| Lane | Reconciler 中表示更新优先级的 bit；本仓库主要用它选择根的同步/可切片投递，不按 Lane 筛选具体 Fiber 或 Hook Update。 |
-| Scheduler | 把并发 callback 投到宏任务并按 5ms deadline 让出的执行器。 |
+| Lane | Reconciler 中表示更新优先级的 bit；本仓库可据此在 Fiber 层 bailout，但不能按 Lane 筛选单条 Hook Update。 |
+| Scheduler | 用优先级最小堆排列 callback，再通过宏任务与 5ms deadline 让出主线程的执行器。 |
 | HostConfig | Reconciler 调用的宿主能力接口；本仓库只提供 DOM 实现。 |
 
 注意：ReactElement 常被简称为 Element；“Fiber 树”在结构上通过链表指针连接。Lane 决定更新优先级，Scheduler 决定 callback 何时占用主线程，两者不是同一个概念。
@@ -135,23 +135,23 @@ demo 入口是 `demos/hello-dom/src/main.ts`。运行 `pnpm dev` 后，页面按
 
 - **Fiber / Reconciler**：保留 child / sibling / return、alternate、Flags 等主干，但 tag、更新类型和恢复策略都远少于官方。
 - **Render / Commit**：阶段划分和核心顺序对齐；Before Mutation 在本仓库为空。删除时两种 Effect cleanup 都在 Mutation 中完成，是教学简化。
-- **Diff**：实现单节点与普通数组的 key / type 复用和移动；不覆盖 Fragment、Portal 等官方分支。
-- **Hooks**：实现 `useState`、`useEffect`、`useLayoutEffect`。`useLayoutEffect` 已实现，并与 Host 更新共用 Fiber 的 `Update` flag，再按 Fiber tag 分流。
-- **Scheduler / Lane**：Scheduler 是 FIFO 队列、固定 5ms deadline；Lane 只有 `SyncLane` / `DefaultLane`。官方的优先级、过期、饥饿处理和 Lane 集合更完整。
-- **HostConfig / DOM**：接口体现宿主解耦，但本仓库只接 DOM；事件是逐节点 `addEventListener`，不是官方合成事件与根节点委托。
+- **Diff**：实现单节点、Fragment 与普通数组的 key / type 复用和移动；不覆盖 Portal 等官方分支。
+- **Hooks / 组件能力**：已实现 state、reducer、ref、memo/callback、context、两种 Effect，以及教学版的 Fragment、memo、forwardRef、Suspense 和 ErrorBoundary；开发期校验与异常恢复仍远少于官方。
+- **Scheduler / Lane**：Scheduler 使用优先级最小堆和固定 5ms deadline；Lane 有 `SyncLane`、`DefaultLane`、`TransitionLane`，并支持 Fiber 级 bailout。单条 Hook Update 没有 Lane，官方的过期、饥饿、跳过与 rebase 更完整。
+- **HostConfig / DOM**：接口体现宿主解耦，但本仓库只接 DOM；`onClick` 使用根容器委托，其他 `onXxx` 逐节点绑定，回调仍是原生事件而非官方 SyntheticEvent。
 - **DOM 创建边界**：Render 的 `completeWork` 会创建尚未挂入文档的 DOM 实例；真正插入、删除、更新已挂载 DOM 在 Commit。不要简化成“Render 完全不碰 DOM API”。
 
 ## 仓库未实现清单
 
 这些能力只用于回答“边界是什么”，本书不展开其官方实现：
 
-- Fragment / Portal / Context / Suspense / lazy / memo / forwardRef
-- Class 组件 / Error Boundary
-- `useRef` / `useMemo` / `useCallback` / `useReducer` / `useTransition` 等；`useLayoutEffect` **已实现**
-- 合成事件与根节点委托
-- 完整 Lane 档位、`beginWork` bailout、Scheduler 优先堆
-- SSR / hydrate、`flushSync` / `startTransition`
-- `ref` 的 commit 写入；Element 虽拆出 `ref` 字段，但没有完整 ref 语义
+- Portal / lazy
+- Class 组件及官方 Class Error Boundary 生命周期（仓库有函数式教学边界）
+- `useTransition` / `useDeferredValue` 等 Hook（`startTransition` 函数已实现）
+- SyntheticEvent、事件插件、捕获阶段与完整事件优先级
+- 完整 Lane 集合、单条 Update 的 Lane 跳过与 rebase、Scheduler 过期和饥饿策略
+- SSR / hydrate、`flushSync`
+- 完整的 ref 语义（宿主对象 ref、函数 ref 与 forwardRef 主路径已实现）
 - style 对象细粒度 Diff、`dangerouslySetInnerHTML`
 
 这些缺口不影响解释本仓库的核心闭环：描述 UI → 构建 Fiber → 可切片 Render → 同步 Commit。遇到清单外的官方能力，应明确“本仓库未实现”，再回到已验证的主线。
