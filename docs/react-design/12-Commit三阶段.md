@@ -34,7 +34,7 @@ Before Mutation 在官方 React 中还会处理 snapshot、选区等工作，本
 
 Mutation 与 Layout 在同一轮同步调用中连续执行，不做时间切片。Passive 不在这段同步主流程中执行；它由 Commit 发现并预约。
 
-## 12.2 Mutation 怎样落实删除、插入和更新
+## 12.2 Mutation 怎样落实删除插入和更新
 
 `commitMutationEffectsOnFiber` 对每个 Fiber 按这个顺序处理：
 
