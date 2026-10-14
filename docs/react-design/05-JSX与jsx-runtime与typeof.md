@@ -4,7 +4,7 @@
 
 ---
 
-demo 手写 `createElement`，是为了让调用在源码里可见。日常写的 `<li>` 浏览器并不认识。打包器在构建时把它换成函数调用，运行时拿到的仍是第 4 章那个对象。
+demo 手写 `createElement`，是为了让调用在源码里可见。日常代码却常写 `<li>`：浏览器不认识这对尖括号，它为什么仍能运行？因为打包器在构建时先把 JSX 换成函数调用，运行时拿到的仍是第 4 章那个对象。
 
 ## 本章书签
 
@@ -23,7 +23,7 @@ demo 手写 `createElement`，是为了让调用在源码里可见。日常写�
 <button onClick={onReverse}>reverse</button>
 ```
 
-编译器有两套常见产物。
+输入是这段 JSX，预期界面是一颗文字为 `reverse` 的按钮，点击后调用 `onReverse`。编译器有两套常见产物。
 
 classic 要求当前文件能看见 `React.createElement`。孩子从第三个参数开始，和第 4 章的手写调用对齐：
 
@@ -31,7 +31,7 @@ classic 要求当前文件能看见 `React.createElement`。孩子从第三个�
 React.createElement('button', { onClick: onReverse }, 'reverse');
 ```
 
-automatic 是现在的默认。编译器自己写上导入，孩子已经放进 config，文件里不必出现 `React` 这个名字：
+automatic 是现代 React 工具链的常见默认。具体采用哪一种转换由 Babel、TypeScript 或构建工具配置决定。automatic 模式下，编译器自己写上导入，孩子已经放进 config，文件里不必出现 `React` 这个名字：
 
 ```js
 import { jsx } from 'react/jsx-runtime';
@@ -98,13 +98,13 @@ export const REACT_ELEMENT_TYPE = Symbol.for('react.element');
 
 `JSON.parse` 之后它像一份元素：有 `type`，有 `props`。JSON 表达不了 Symbol。解析结果没有 `$$typeof`。就算有人写成 `"$$typeof": "react.element"`，那也是字符串，和 `Symbol.for('react.element')` 不相等。`isReactElement` 会拒绝它，调和器不会按元素去创建节点。
 
-`Symbol.for` 按名字到全局表里取同一个 Symbol。`react` 包创建元素、调和器再来检查时，哪怕它们是两份加载进来的代码，名字相同就对得上。`Symbol()` 每次都会造出一个新值，合法元素也会被拒掉。
+`Symbol.for` 按名字到当前 JavaScript agent 的全局注册表里取同一个 Symbol。`react` 包创建元素、调和器再来检查时，即使模块有多个副本，名字相同也能对上。`Symbol()` 每次都会造出一个新值，两个包各自调用时就无法相等。
 
 这只封住「把不可信的普通对象当成元素」这一条。文本怎么转义、URL 和事件能不能执行，要靠宿主实现和业务数据各自把关。本仓库没有 `dangerouslySetInnerHTML`，上面的 JSON 不会真的变成脚本；字段仍按这个规则检查，读官方源码时对得上。
 
 ## 5.3 三个导出名共用一份实现
 
-`packages/react/package.json` 把两条约口都指到 `jsx.ts`：
+`packages/react/package.json` 把两个子路径入口都指到 `jsx.ts`：
 
 ```text
 react/jsx-runtime      生产构建使用的 jsx、jsxs

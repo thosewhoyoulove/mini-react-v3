@@ -4,7 +4,7 @@
 
 ---
 
-第 3 章停在 `createElement(App, null)`：它返回一个普通对象，函数还没执行，DOM 也还没有。本章把 `ListDemo` 里最小的一次调用拆开，看这个对象的每一格交给谁。Fiber 要到第 6 章才出现。
+第 3 章停在 `createElement(App, null)`：为什么这一行既不执行 `App`，也不创建 DOM？因为它只返回一份描述。本章用 `ListDemo` 里最小的一次调用拆开这份对象，看每一格交给谁。Fiber 要到第 6 章才出现。
 
 ## 本章书签
 
@@ -35,7 +35,7 @@ createElement('li', { key: item }, item);
 }
 ```
 
-五格就这些。没有 `HTMLLIElement`，也没有「插到谁前面」这种步骤。浏览器节点要等整棵描述调和完、进入提交阶段，才由宿主实现创建。
+五格就这些。没有 `HTMLLIElement`，也没有「插到谁前面」这种步骤。本仓库处理到 `completeWork` 时才由宿主实现创建尚未挂载的 DOM；Commit 再把它插入文档。
 
 同一页上的按钮是同一种对象，只是 `props` 里多了事件：
 
@@ -71,7 +71,7 @@ export interface ReactElement {
 }
 ```
 
-`$$typeof` 的类型写成 `symbol | number`，是为了和没有 `Symbol` 的旧环境对齐。本仓库只创建 `Symbol.for('react.element')`。为什么必须是 Symbol，下一章再说。这里先把它当成「这是一份合法描述」的标记。
+类型声明允许 `symbol | number`，但本仓库只创建 `Symbol.for('react.element')`，没有数字形式的回退路径。为什么这里选择 Symbol，下一章再说。现在先把它当成「这是一份合法描述」的标记。
 
 ## 4.2 createElement 做的四件事
 
@@ -140,6 +140,8 @@ createElement(
 
 `props.children` 是长度为 2 的数组。每个 `li` 自己的 `props.children` 仍是字符串 `'A'` 或 `'B'`。孩子的形态后面会决定调和走单节点还是列表，第 10 章再分叉。本章只要能从一次调用推出 `children` 是单值还是数组。
 
+这里讲的是本仓库的 `createElement`。官方 React 在开发构建中还可能保存 owner、源码位置或调试信息，也会做额外告警；不要把这五格当成所有 React 版本的完整内部对象。
+
 ## 4.3 这些字段后来交给谁
 
 五格的分工可以收成一张表。现在看不懂「谁用」那一列里的函数名也没关系，它们是后文的入口：
@@ -168,7 +170,7 @@ createElement(
 
 ### 面试回答
 
-以 `createElement('li', { key: 'A' }, 'A')` 为例。返回值里 `key` 是字符串 `'A'`，`props` 只有 `children: 'A'`。`key` 和 `ref` 被拆出去，是因为它们交给调和器和提交阶段，不交给组件当参数。一个孩子保持原值，多个孩子才收成数组，后面据此选择单节点还是列表调和。`$$typeof` 用来认出这个对象。组件函数要等工作循环按 `type` 调用，宿主节点要等提交阶段才创建。
+以 `createElement('li', { key: 'A' }, 'A')` 为例。返回值里 `key` 是字符串 `'A'`，`props` 只有 `children: 'A'`。`key` 和 `ref` 被拆出去，是因为它们交给调和器和提交阶段，不交给组件当参数。一个孩子保持原值，多个孩子才收成数组，后面据此选择单节点还是列表调和。`$$typeof` 用来认出这个对象。组件函数要等工作循环按 `type` 调用；宿主节点在 `completeWork` 创建，Commit 才把它挂进文档。
 
 ### 常见追问
 
@@ -186,7 +188,7 @@ createElement(
 
 ### 容易说错
 
-- ReactElement 是描述对象。DOM 在提交阶段创建，Fiber 在调和时另建。
+- ReactElement 是描述对象。Fiber 在调和时另建；本仓库在 `completeWork` 创建离屏 DOM，在 Commit 修改已挂载的文档。
 - `key` 不会出现在组件的 `props` 里。本仓库复制属性时会跳过它。
 - `createElement(App)` 不会调用 `App`。调用发生在处理函数组件的那一步。
 

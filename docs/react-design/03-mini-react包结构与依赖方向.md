@@ -39,7 +39,9 @@ export function useState<S>(
 
 `ReactCurrentDispatcher.current` 平时是 `null`。组件函数外面调用 `useState`，就会走到上面这个错误。真正的 mount / update 实现在 `packages/react-reconciler/src/hooks.ts`。调和器在调用组件函数之前，把当前这套实现填进 `current`，调用结束再清掉。
 
-可以把它想成一个插座。`react` 包只规定插座的形状：`useState`、`useEffect`、`useRef` 这些函数各自该怎么调用。谁在渲染，谁来插上实现。因此应用只依赖 `react` 和 `react-dom`，不必知道调和器的文件名。
+如果在组件外执行 `useState(0)`，可预测结果不是返回 `[0, setState]`，而是抛出 `Invalid hook call`。进入 `renderWithHooks` 后，同一行调用才会被转发到本轮的 mount 或 update 实现。
+
+可以把 `current` 想成一个插座。这个比喻只描述“运行时替换实现”这一点：精确地说，`react` 包声明 `Dispatcher` 接口并保存一个可变引用，调和器在渲染函数组件期间写入对应实现。因此应用只依赖 `react` 和 `react-dom`，不必知道调和器的文件名。
 
 如果把队列逻辑直接写进 `useState`，`react` 就要 import `react-reconciler`。而调和器为了拿到 `ReactCurrentDispatcher` 已经要 import `react`。两条依赖对着走，包就循环了，Hook 也会和某一种调和过程焊死。第 2 章说调和器不该认识 `document`，这里是同一条原则的另一面：公共 API 也不该认识某一次渲染的内部实现。
 
@@ -72,7 +74,7 @@ react-dom 也直接依赖 react 和 shared
 
 读源码时用一条反例检查：调和器里出现 `document`，或 `scheduler` 里出现 Fiber，就是方向反了。调度器如果知道 Fiber，它就不再是「一段回调什么时候跑」，而会和这棵 UI 树绑在一起。
 
-`react` 还导出了 `./jsx-runtime`。demo 手写 `createElement`，不走这条约口；打包器编译 JSX 时会走。第 5 章对照这两种入口，它们产出的对象是同一种。
+`react` 还导出了 `./jsx-runtime`。demo 手写 `createElement`，不走这条入口；打包器编译 JSX 时会走。第 5 章对照这两种入口，它们产出的对象是同一种。
 
 ## 3.3 从 createRoot 走到下一次点击
 
