@@ -2,137 +2,170 @@
 
 [← 返回总目录](../../React设计与实现.md) · [上一章](./16-useEffect与useLayoutEffect.md) · [下一章 →](./18-最小Lane.md)
 
-> 主文件：`packages/scheduler/src/Scheduler.ts`
-> 本章只讲「主线程上的任务怎么排队、怎么让出」。更新有多急、根下一次走同步还是可切片路径，见 [第 18 章](./18-最小Lane.md) 的 Lane。
+一棵大 Fiber 树如果在一个 JavaScript 任务里从头算到尾，输入和绘制都只能等待。把工作拆开之后又出现两个问题：下一段 callback 该先跑谁，正在执行的 Render 何时暂停？本章用三个最小任务说明：最小堆负责顺序，MessageChannel 负责再次进入主线程，固定 5ms deadline 负责让出。
 
-浏览器一帧通常以约 16ms 作为直觉参照。若 React 在一个任务里把大树全部 reconcile，输入和绘制都会卡住。本仓库把工作拆成多个 MessageChannel 任务：每个任务设置 5ms deadline，`workLoop` 反复问 `shouldYield()`，到点就停。它不与浏览器帧边界严格对齐。
+> 源码范围：`packages/scheduler/src/Scheduler.ts`、`packages/react-reconciler/src/workLoop.ts`
+>
+> 本章以当前教学仓库为准。官方 React Scheduler 还有 expiration time、延迟任务和 continuation callback 等机制，不能直接由这里的几十行实现外推。
 
 ## 本章书签
 
-- [17.1 为什么用 MessageChannel](#171-为什么用-messagechannel)
-- [17.2 5ms deadline 与 `shouldYield`](#172-5ms-deadline-与-shouldyield)
-- [17.3 `schedule` / `cancel`](#173-schedule--cancel)
-- [17.4 和 Lane 的分工](#174-和-lane-的分工)
+- [17.1 任务不是 FIFO：先比 `priorityLevel`，再比 `startTime`](#171-任务不是-fifo先比-prioritylevel再比-starttime)
+- [17.2 MessageChannel 如何承接任务，5ms 又如何形成时间片](#172-messagechannel-如何承接任务5ms-又如何形成时间片)
+- [17.3 `schedule/cancel`、调试同步边界与 Lane 的分工](#173-schedulecancel调试同步边界与-lane-的分工)
 - [面试复习](#面试复习)
 
 ---
 
-## 17.1 为什么用 MessageChannel
+## 17.1 任务不是 FIFO：先比 `priorityLevel`，再比 `startTime`
 
-要把「现在立刻跑完整棵树」拆开，必须把后续工作排进**宏任务**：当前这段 JS 跑完后，浏览器有机会先绘制、处理输入，再执行下一拍。
-
-常见投递方式对比：
-
-| 方式 | 问题 |
-| --- | --- |
-| `setTimeout(fn, 0)` | 最小延迟常被夹到 4ms+，切片之间空隙大 |
-| `Promise` / `queueMicrotask` | 微任务会在绘制前把队列清空，切不出去 |
-| **MessageChannel** | `port.postMessage` 排一个较及时的宏任务：当前 JS 结束 → 可先绘制/输入 → 再 `onmessage` |
-
-本仓库用一对 port：往 `port2` 发消息，`port1.onmessage` 被触发时从队列取出一个 task 执行。
-
-```text
-unstable_scheduleCallback
-    → taskQueue.push
-    → port.postMessage(null)
-    →（宏任务）onmessage：设 deadline，跑 callback
-    → 队列还有 → 再 postMessage
-```
-
-`SyncLane` **不会**走进这个文件，它走 `queueMicrotask`（第 18 章）。Scheduler 服务的是可中断的并发路径（以及 Commit 后延后的 `useEffect`）。
-
----
-
-## 17.2 5ms deadline 与 `shouldYield`
-
-每个切片开始时：
+先假设三个任务按 A、B、C 的顺序加入：
 
 ```ts
-deadline = performance.now() + yieldInterval; // yieldInterval = 5
+unstable_scheduleCallback(NormalPriority, () => console.log('A'));
+unstable_scheduleCallback(UserBlockingPriority, () => console.log('B'));
+unstable_scheduleCallback(NormalPriority, () => console.log('C'));
 ```
 
-`workLoopConcurrent` 每处理完一个 Fiber 就问：
+预期不是 `A B C`，而是 `B A C`：B 后入队，但它的优先级数字更小。A 与 C 同为 Normal，才继续按较早的 `startTime` 排序。
+
+当前仓库的 `taskQueue` 是**最小堆**。堆顶 `taskQueue[0]` 始终保存比较结果最小的任务：
 
 ```ts
-export function unstable_shouldYield(): boolean {
-  return performance.now() >= deadline;
+function isLess(a: Task, b: Task): boolean {
+  if (a.priorityLevel !== b.priorityLevel) {
+    return a.priorityLevel < b.priorityLevel;
+  }
+  return a.startTime < b.startTime;
 }
 ```
 
-到点则退出循环，`workInProgress` 停在下一个节点；`ensureRootIsScheduled` 再约一拍宏任务，从断点继续。官方会随帧率调整切片长度，教学版写死 5ms，方便对着源码讲。
-
----
-
-## 17.3 `schedule` / `cancel`
-
-```ts
-unstable_scheduleCallback(priorityLevel, callback) → task id
-unstable_cancelCallback(id)  // 把对应 task.callback 置 null
-```
-
-导出的档位与官方对齐（数字越小越急）：
+五档优先级的数字越小越靠近堆顶：
 
 ```text
-ImmediatePriority      = 1
-UserBlockingPriority   = 2
-NormalPriority         = 3   ← 本仓库 DefaultLane / Passive effect 用这个
-LowPriority            = 4
-IdlePriority           = 5
+ImmediatePriority      1
+UserBlockingPriority   2
+NormalPriority         3
+LowPriority            4
+IdlePriority           5
 ```
 
-**官方** Scheduler 会按 priority 进不同优先级堆。**本仓库仍是 FIFO**：`priorityLevel` 参数接了，但不靠堆插队；档位切换靠 reconciler **cancel 掉旧 task，再约新的**（典型：Default 还没跑，Sync 插队）。
+因此，当前 Scheduler 不是 FIFO 队列。只有优先级相同且 `startTime` 能反映先后时，执行顺序才表现得像先入先出；实现没有再用 `id` 处理“时间戳完全相同”的稳定排序。
 
-`root.callbackNode` 记下 task id，正是为了能被 `unstable_cancelCallback` 作废。
+`unstable_scheduleCallback` 的工作很少：
 
----
+1. 分配递增 `id`，记录 `priorityLevel` 与当前 `startTime`。
+2. 把任务追加到数组末尾，再用 `siftUp` 恢复最小堆。
+3. `port.postMessage(null)` 预约一个 MessageChannel 宏任务。
 
-## 17.4 和 Lane 的分工
+`unstable_cancelCallback(id)` 则线性扫描堆，把匹配任务的 `callback` 设为 `null`。它不立即从堆中间删除节点，因为那会额外维护堆结构；之后 `popTask` 弹到这个节点时会跳过它。取消只使尚未开始的 callback 失效，不能撤回已经执行的代码。
 
-一句话：**Scheduler 不认识 Fiber；真正的更新优先级在 reconciler 的 Lane。**
+这与官方 React 的共同点是都要表达 Scheduler 优先级；但官方实现的排序键和任务生命周期更完整。当前仓库刻意只保留“优先级、开始时间、最小堆”这条主线。
 
-| | Scheduler（本章） | Lane（第 18 章） |
+## 17.2 MessageChannel 如何承接任务，5ms 又如何形成时间片
+
+最小堆只决定“下一条是谁”，不会自动让 callback 获得主线程。当前仓库创建一对 MessageChannel port：
+
+```text
+schedule callback
+  → push + siftUp
+  → port2.postMessage(null)
+  → 后续宏任务触发 port1.onmessage
+  → popTask 取堆顶
+  → 设置 deadline
+  → 执行一条 callback
+  → 堆中还有任务，再 postMessage
+```
+
+使用宏任务的目的，是让当前 JavaScript 栈结束后把控制权还给宿主。相比之下，连续使用 `queueMicrotask` 会在浏览器考虑下一轮任务前清空微任务队列，不适合作为这里的切片边界。`setTimeout(..., 0)` 也能形成宏任务，但可能受到定时器最小延迟限制；MessageChannel 更适合快速续接。
+
+不过，“进入下一个宏任务”不等于“浏览器一定已经绘制”。浏览器在任务之间有机会处理输入和渲染，是否实际 paint 仍由宿主决定。Scheduler 本身没有绘制完成信号。
+
+每次 `onmessage` 取出一条任务后，当前仓库设置固定截止时间：
+
+```ts
+deadline = unstable_now() + 5;
+```
+
+随后 reconciler 的 `workLoopConcurrent` 在每个 Fiber 工作单元之间检查：
+
+```ts
+while (workInProgress != null && !unstable_shouldYield()) {
+  performUnitOfWork(workInProgress);
+}
+```
+
+`unstable_shouldYield()` 只是比较 `performance.now()` 是否达到 `deadline`。若达到 5ms，循环退出，`workInProgress` 仍指向下一个待处理 Fiber。`performConcurrentWorkOnRoot` 再通过 `ensureRootIsScheduled` 安排一个 Scheduler 任务，下一拍从断点继续。
+
+这里有三个边界：
+
+- 5ms 是固定时间预算，不是“一帧 16.7ms”的精确切分，也不与刷新率同步。
+- 检查发生在 Fiber 单元之间；单个 `performUnitOfWork` 若本身超过 5ms，Scheduler 不能从函数中间抢占。
+- 当前 callback 不通过返回 continuation 续跑，而是由 reconciler 显式再次 schedule。官方 Scheduler 支持更完整的 continuation 与宿主调度策略。
+
+## 17.3 `schedule/cancel`、调试同步边界与 Lane 的分工
+
+当前仓库公开的核心操作可以先压缩成两行：
+
+```ts
+const id = unstable_scheduleCallback(priorityLevel, callback);
+unstable_cancelCallback(id);
+```
+
+正常模式下，第一行把 callback 放进最小堆并返回任务 id；第二行可在任务开始前把它作废。`workLoop.ts` 把这个 id 保存到 `root.callbackNode`，当根的调度档位改变时取消旧任务。
+
+`enableSchedulerDebugging` 打开时是一个重要例外：
+
+```ts
+if (enableSchedulerDebugging) {
+  callback();
+  return id;
+}
+```
+
+此时 callback 在 `unstable_scheduleCallback` 的当前调用栈内**同步执行**，既不入堆，也不经过 MessageChannel，更没有 5ms deadline 所形成的异步切片边界。返回的 id 只是保持 API 形状；之后调用 `unstable_cancelCallback(id)` 找不到对应堆节点，也不可能撤销已经完成的 callback。这个开关用于让教学测试宿主不必等待宏任务，不能拿它观察真实异步调度顺序。
+
+最后必须把 Scheduler 与 Lane 分开：
+
+| 问题 | Lane（reconciler） | Scheduler |
 | --- | --- | --- |
-| 问的是 | 这段 callback 何时占用主线程、跑多久 | 这次更新多急、根下一次按哪档投递 |
-| 载体 | 任务队列 + deadline | Fiber / `pendingLanes` 比特位 |
-| 本仓库职责 | 宏任务、5ms 切片、按 id 取消 | 决定 sync / concurrent、插队重启 |
+| 表达什么 | 哪次 React 更新更急，本轮处理哪些更新 | 已经投递的 callback 谁先获得主线程 |
+| 数据放在哪 | Fiber 的 `lanes`、根的 `pendingLanes` | 最小堆中的 `Task` |
+| 是否认识 Fiber | 是 | 否，只接收 callback |
+| 当前仓库的主要输出 | 选择同步或并发路径、决定是否重启 WIP | 优先级排序、宏任务投递、5ms deadline、取消 |
 
-对接发生在 `ensureRootIsScheduled`：先看最高 Lane，再决定投递方式——`SyncLane` → 微任务；`DefaultLane` → `unstable_scheduleCallback(NormalPriority, …)`。细节与对照表见下一章。
+桥梁是 `ensureRootIsScheduled`：
+
+```text
+SyncLane       → queueMicrotask → workLoopSync
+DefaultLane    → NormalPriority → Scheduler → workLoopConcurrent
+TransitionLane → LowPriority    → Scheduler → workLoopConcurrent
+```
+
+所以“Lane 高优先级”和“Scheduler 高优先级”有关联，却不是同一个值体系。SyncLane 甚至不进入 Scheduler，它走微任务并一次执行完。Default 与 Transition 才映射为 Scheduler 的 Normal 与 Low。
+
+如果一个尚未开始的低优 Scheduler 任务需要让路，reconciler 会取消 `root.callbackNode` 再重新投递。若并发 Render 已经做出半棵 WIP，新更新是否要求从根重启，则由 `rootNeedsRestart`、当前 render lanes 等 reconciler 状态判断。取消 callback 与丢弃半成品 WIP 是两件不同的事。
+
+Passive Effect 也会直接投递 `NormalPriority` callback，但它不是一次 Fiber 更新，因此没有为它创建 Lane。它只是借用 Scheduler 的宏任务与排序能力。
 
 ## 面试复习
 
-### 一句话结论
+**一句话回答：** 当前 Scheduler 用 `priorityLevel`、再用 `startTime` 排序最小堆；MessageChannel 每次取一条 callback，固定 5ms deadline 让并发 work loop 在 Fiber 之间暂停。Lane 决定 React 更新做什么，Scheduler 决定 callback 何时获得主线程。
 
-Scheduler 只负责把 callback 放进主线程并用 5ms deadline 让出；Lane 才决定更新优先级与本轮 Render，而本仓库 Scheduler 是 FIFO，不具备官方优先级堆的原生插队能力。
+**为什么不能说它是 FIFO？** 后加入的高优任务会先于低优任务出堆；同优先级才比较 `startTime`。
 
-### 面试回答（为什么→机制→仓库落点→官方差异）
+**`cancelCallback` 做了什么？** 把尚在堆中的任务 callback 置空，等弹出时跳过。它不撤销已执行代码，也不负责清理 WIP。
 
-为什么：React 既要表达「哪次更新更急」，又要控制「一段 JS 占用主线程多久」，两者不是一个问题。机制：Lane 在 reconciler 选择 Sync/Default；Default 映射为 Scheduler 宏任务并在 Fiber 单元之间检查 `shouldYield`，Sync 直接走微任务。仓库落点：`Scheduler.ts` 维护 FIFO `taskQueue`、deadline 和按 id 取消；`workLoop.ts` 的 `ensureRootIsScheduled` 做 Lane 到投递方式的桥接。官方差异：官方 Scheduler 用优先级堆和更完整的过期时间；本仓库忽略传入的 `priorityLevel` 排序，所谓插队依靠 reconciler 取消旧 callback、另走更早的微任务。
+**调试开关打开后还有时间切片吗？** `unstable_scheduleCallback` 会同步执行 callback，不经过堆和 MessageChannel，因此失去正常异步切片边界；返回 id 也无法再取消这次执行。
 
-### 常见追问
-
-**Q：Sync 如何插队一个尚未执行的 Default？**
-A：Lane 层先发现更高优更新；`ensureRootIsScheduled` 把旧 task 的 callback 置空，再预约 Sync 微任务。不是 FIFO Scheduler 自己把 Sync 插到队首。
-
-**Q：取消 task 是否等于丢弃半成品 WIP？**
-A：不等于。取消只阻止旧 callback 执行；若 Default 已经切片产生 WIP，还要由 work loop 设置/检查重启状态并从根 `prepareFreshStack`。
-
-**Q：切片暂停后为何能续跑，而插队后为何要重启？**
-A：单纯超时没有新数据，`workInProgress` 可保留断点；同档或更高优更新到来后，已处理节点可能没看见新队列，所以半成品必须丢弃。
-
-**Q：Passive effect 走 Scheduler，是否也有 Lane？**
-A：没有。它直接预约 `NormalPriority` callback，只借用宏任务通道，不参与更新 Lane 选择。
-
-### 容易说错
-
-- 不要说 Scheduler 决定 Fiber 更新优先级；它甚至不认识 Fiber。
-- 不要说本仓库 Scheduler 会按五档 priority 排序；常量存在，但队列严格 FIFO。
-- 不要把 `cancelCallback` 与 WIP 重启混成一步；一个管任务，一个管 Render 状态。
+**5ms 到点能打断任意 JavaScript 吗？** 不能。它只在 work loop 主动调用 `shouldYield` 的位置生效，当前 Fiber 单元必须先执行完。
 
 ### 源码入口
 
+- `packages/scheduler/src/Scheduler.ts`：`isLess`、`siftUp`、`siftDown`、`popTask`
 - `packages/scheduler/src/Scheduler.ts`：`unstable_scheduleCallback`、`unstable_cancelCallback`、`unstable_shouldYield`
-- `packages/react-reconciler/src/workLoop.ts`：`workLoopConcurrent`
-- `packages/react-reconciler/src/workLoop.ts`：`ensureRootIsScheduled`、`performConcurrentWorkOnRoot`
+- `packages/react-reconciler/src/workLoop.ts`：`workLoopConcurrent`、`performConcurrentWorkOnRoot`
+- `packages/react-reconciler/src/workLoop.ts`：`ensureRootIsScheduled`
 
 ---
 

@@ -1,74 +1,119 @@
-# 第 14 章：Hook 链表与 mount / update 两套 Dispatcher
+# 第 14 章：Hook 链表与 Dispatcher
 
 [← 返回总目录](../../React设计与实现.md) · [上一章](./13-函数组件的执行时机.md) · [下一章 →](./15-useState与更新队列.md)
 
-> 主文件：`packages/react-reconciler/src/hooks.ts`、`packages/react/src/ReactHooks.ts`、`ReactCurrentDispatcher.ts`
-> 对外 API 只读 Dispatcher；真正往 Fiber 上接链表的，是 reconciler 里成对的 `mount*` / `update*`。
+同一个组件每次执行都会重新调用 `useState`，React 又没有让我们给 Hook 写 `key`。那么第二次渲染时，它怎样知道“这次的第一个 `useState`”仍对应上次那份状态，而不会拿到后面 `useRef` 或 `useEffect` 的数据？答案不是变量名，而是稳定的调用顺序、Fiber 上的 Hook 链表，以及渲染期间临时启用的 Dispatcher。
+
+> 源码入口：`packages/react-reconciler/src/hooks.ts`、`packages/react/src/ReactHooks.ts`、`packages/react/src/ReactCurrentDispatcher.ts`
 
 ## 本章书签
 
-- [14.1 Hook 链表挂在哪](#141-hook-链表挂在哪)
-- [14.2 游标怎么挪](#142-游标怎么挪)
-- [14.3 mount 与 update](#143-mount-与-update)
-- [14.4 Dispatcher](#144-dispatcher)
+- [14.1 调用顺序就是 Hook 的身份](#141-调用顺序就是-hook-的身份)
+- [14.2 mount 新建链，update 对齐旧链](#142-mount-新建链update-对齐旧链)
+- [14.3 Dispatcher 划定 Hook 的执行边界](#143-dispatcher-划定-hook-的执行边界)
 - [面试复习](#面试复习)
 
 ---
 
-## 14.1 Hook 链表挂在哪
+## 14.1 调用顺序就是 Hook 的身份
 
-每个函数组件 Fiber 用 `memoizedState` 挂一条单向链表：
+先看一个最小组件：
 
-```text
-fiber.memoizedState → Hook0 → Hook1 → Hook2 → null
+```tsx
+function Profile() {
+  const [name, setName] = useState('Ada'); // 第 1 次 Hook 调用
+  const inputRef = useRef(null);            // 第 2 次 Hook 调用
+  useEffect(() => console.log(name), [name]); // 第 3 次 Hook 调用
+  return <input ref={inputRef} value={name} />;
+}
 ```
 
-一格 Hook 的字段：
+源码不会保存 `name`、`inputRef` 这些局部变量名。当前仓库为每个函数组件 Fiber 保存一条单向链表：
 
-| 字段 | 用途 |
+```text
+fiber.memoizedState
+        │
+        ▼
+      Hook0 ──next──► Hook1 ──next──► Hook2 ──next──► null
+      useState       useRef           useEffect
+```
+
+因此，Hook 的身份就是“它是本次组件执行中的第几次 Hook 调用”。更新时，第 1 次调用取旧链第 1 格，第 2 次调用取第 2 格，以此类推。Hook 名称不同，也仍按同一顺序混排在一条链中。
+
+这正是 Hook 不能放在条件分支里的原因：
+
+```tsx
+function Profile({ editable }) {
+  const [name] = useState('Ada'); // 第 1 格
+  if (editable) {
+    useRef(null);                 // 有时出现的第 2 格
+  }
+  useEffect(() => {}, []);        // 可能从第 2 格滑到第 3 格
+}
+```
+
+若 `editable` 从 `true` 变成 `false`，本轮第 2 次调用已变成 `useEffect`，旧链第 2 格却属于 `useRef`。链表没有名称可以补救这种错位。当前仓库会在“本轮调用比上轮多”时抛错，但没有完整检查“本轮调用更少”以及 Hook 类型变化；官方 React 的开发构建还有更完整的顺序校验。无论是否立刻报错，顶层调用规则都不能破坏。
+
+链表中每格都有相同外壳：`memoizedState` 保存该 Hook 的主要数据，`queue` 和 `baseQueue` 服务于状态更新，`next` 指向下一格。不同 Hook 填入的数据不同：
+
+| API | 当前仓库中的存储位置与内容 |
 | --- | --- |
-| `memoizedState` | useState：当前值；useEffect：`Effect` 对象 |
-| `queue` | useState 的更新队列（`pending` + `dispatch`） |
-| `baseQueue` | 已从 pending 截过来、若 render 被丢掉还能重放的环形队列 |
-| `next` | 下一格 Hook |
+| `useState` | 一格普通 Hook；`memoizedState` 是状态值，`queue` 是更新队列 |
+| `useReducer` | 一格普通 Hook；状态在 `memoizedState`，action 队列与 reducer 信息在 `queue` |
+| `useEffect` | 一格普通 Hook；`memoizedState` 是 `{ tag, create, destroy, deps }` |
+| `useLayoutEffect` | 与 `useEffect` 同形，`tag` 标出 Layout 类型 |
+| `useRef` | `memoizedState` 保存稳定的 `{ current }` 对象 |
+| `useMemo` | `memoizedState` 保存 `[计算结果, deps]` |
+| `useCallback` | `memoizedState` 保存 `[函数, deps]` |
+| `useContext` | **不占普通 Hook 格**；读取值后把 `{ context, memoizedValue }` 接到 `fiber.dependencies` |
 
-`useState` 和 `useEffect` / `useLayoutEffect` **混在同一条链上**。effect 靠 `memoizedState` 里是不是带 `create` / `deps` / `tag` 的对象来认，不靠单独一条链表。组件里第几次调用 `useXxx`，就对应第几格。
+`useContext` 是本仓库里需要特别记住的例外。它也通过 Dispatcher 调用，但 `readContext` 主要登记 Context 依赖，供 bailout 前检查值是否变化；它不会调用 `mountWorkInProgressHook` 或 `updateWorkInProgressHook`。每次 `renderWithHooks` 开始时，wip 的 `dependencies` 会清空并重新收集。
 
-## 14.2 游标怎么挪
+这里也有一处教学简化：当前仓库直接遍历 Hook 链来提交 effect。官方 React 同样有 Hook 链，但 effect 还会组织到函数组件的 effect 队列中，数据结构和开发期检查都更完整。
 
-模块级三个指针（组件跑完必须清掉）：
+## 14.2 mount 新建链，update 对齐旧链
 
-| 指针 | 指向谁 |
-| --- | --- |
-| `currentlyRenderingFiber` | 正在执行的那个函数组件 wip |
-| `workInProgressHook` | wip 链表上刚接好的那一格，下一格接到它的 `next` |
-| `currentHook` | current 链表上正在对齐的那一格，下一格从它的 `next` 取 |
+首次渲染没有旧 Hook 可读，`mountWorkInProgressHook` 每被调用一次就创建一格：
 
-首次渲染只有前两个：每调一次 Hook，`mountWorkInProgressHook` 往后 new 一格。
+```text
+第一次调用：fiber.memoizedState = Hook0
+第二次调用：Hook0.next = Hook1
+第三次调用：Hook1.next = Hook2
+```
 
-更新时两个游标一起走：`currentHook` 在旧链上对齐，`workInProgressHook` 在新链上接克隆。两棵树各一条链表——current 只读，wip 才是本轮要 commit 的。
+`workInProgressHook` 始终指向刚接好的链尾。具体的 `mountState`、`mountRef`、`mountEffect` 再把状态、ref 或 effect 数据写进返回的这一格。链表负责“这是第几格”，具体 Hook 实现负责“这一格装什么”。
 
-## 14.3 mount 与 update
+更新渲染不能直接改已提交的 current 树。此时同时存在两条链：
 
-`mountWorkInProgressHook` 四步：
+```text
+current Fiber:  old0 ─► old1 ─► old2
+                   │       │       │
+                   ▼       ▼       ▼
+wip Fiber:      new0 ─► new1 ─► new2
+```
 
-1. new 一个空 Hook（`next` 还是 `null`）。
-2. 本组件第一个 → 写成 `fiber.memoizedState`，游标指过去。
-3. 已有 Hook → 接到当前游标的 `next`，游标挪到新节点。
-4. 返回这一格，给 `mountState` / `mountEffectImpl` 填数据。
+`updateWorkInProgressHook` 用两个游标逐格完成对齐：
 
-`updateWorkInProgressHook` 四步：
+- `currentHook` 指向旧链当前读到的格子；
+- `workInProgressHook` 指向 wip 新链刚接好的格子；
+- `currentlyRenderingFiber` 指向正在执行的函数组件 wip Fiber。
 
-1. 取 current 下一格：第一次从 `alternate.memoizedState` 取头，之后走 `currentHook.next`。
-2. current 没有下一格 → 抛「Rendered more hooks than during the previous render」。
-3. 克隆一格到 wip（复用 `queue`，`next` 先空着），接到 wip 链表尾。
-4. 返回克隆，给 `updateState` / `updateEffectImpl` 算新值。
+第一次调用从 `currentlyRenderingFiber.alternate.memoizedState` 取得旧链表头，以后沿 `currentHook.next` 前进。每读到一格，就复制其 `memoizedState`、`baseQueue` 和 `queue`，再把副本接到 wip 链尾。Hook 节点是新的，但状态更新使用的 `queue` 对象会复用，所以同一个 `setState` 的函数身份可以跨渲染保持稳定。
 
-`renderWithHooks` 开头会把 `wip.memoizedState = null` 并清游标：本轮从头建，不在上一轮 wip 链表上打补丁。若 concurrent 被重启，半成品链表直接丢掉，下次从 current 再克隆。
+`renderWithHooks` 在执行组件之前把 `workInProgress.memoizedState` 置空，表示本轮要从头构造 wip 链，而不是在旧 wip 链上修改。若渲染被打断并放弃，半成品 wip 链也可以一起丢弃；下次仍从已提交的 current 链重新对齐。
 
-## 14.4 Dispatcher
+对 `Profile` 来说，一轮更新可以读成下面四步：
 
-`packages/react` 里的 `useState` 自己不算状态：
+1. 第 1 次 `useState`：克隆 `old0`，`updateState` 再处理它的队列。
+2. 第 2 次 `useRef`：克隆 `old1`，返回其中同一个 ref 对象。
+3. 第 3 次 `useEffect`：克隆 `old2`，比较新旧 `deps`。
+4. 组件执行结束：新链留在 wip Fiber，等待后续 commit 成为 current。
+
+这套机制只靠位置匹配，不会搜索“哪一格是 `useState`”。顺序稳定不是风格建议，而是数据结构成立的前提。
+
+## 14.3 Dispatcher 划定 Hook 的执行边界
+
+应用调用的 `useState` 并不直接操作 Fiber。`react` 包中的公开 API 只做转发：
 
 ```ts
 export function useState(initialState) {
@@ -76,55 +121,55 @@ export function useState(initialState) {
 }
 ```
 
-`ReactCurrentDispatcher.current` 是一个可替换的对象。reconciler 准备了两套：
+Dispatcher 可以理解为“当前这段组件执行应使用哪套 Hook 实现”的函数表。当前仓库准备了两套：
 
 ```ts
-HooksDispatcherOnMount  = { useState: mountState, useEffect: mountEffect, … }
-HooksDispatcherOnUpdate = { useState: updateState, useEffect: updateEffect, … }
+HooksDispatcherOnMount = {
+  useState: mountState,
+  useRef: mountRef,
+  useEffect: mountEffect,
+  // ...
+};
+
+HooksDispatcherOnUpdate = {
+  useState: updateState,
+  useRef: updateRef,
+  useEffect: updateEffect,
+  // ...
+};
 ```
 
-`renderWithHooks` 在调用组件函数之前写入，返回之后置 `null`。这样：
+`renderWithHooks` 查看 current 是否已有普通 Hook 链：没有就安装 mount Dispatcher，有就安装 update Dispatcher；随后才调用 `Component(props)`。所以组件里的同一句 `useState(0)`，首次执行会创建链表格，更新时则会克隆并读取对应旧格。
 
-- 应用继续 `import { useState } from 'react'`，和官方用法一致。
-- `react` 包不必依赖 reconciler 的实现细节。
-- 同一句 `useState(0)`，首次和更新自动走不同函数，调用方无感。
+```text
+renderWithHooks
+  → 设置 currentlyRenderingFiber 与链表游标
+  → ReactCurrentDispatcher.current = mount 或 update 表
+  → 执行 Component(props)
+  → finally 中把 Dispatcher 和游标全部清空
+```
 
-依赖方向（第 3 章）在这里落地：`react-reconciler` 依赖 `react` 只为了取 / 写 Dispatcher；真正的链表逻辑全部留在 `hooks.ts`。
+`finally` 是边界的关键。即使组件抛错，`ReactCurrentDispatcher.current` 也会恢复为 `null`，避免下一个组件误用残留游标。组件渲染之外调用 Hook 时，没有可用 Dispatcher，也没有“正在渲染的 Fiber”，因此属于非法 Hook 调用。Dispatcher 不是 Scheduler：它不负责决定任务何时运行，只负责把公开 Hook API 分派到当前渲染阶段的实现。
 
-下一章专讲 `useState` 那一格里的环形队列，以及 `setState` 如何标 lane 进工作循环。
+当前仓库以 `current == null || current.memoizedState == null` 判断 mount。只使用 `useContext` 的组件没有普通 Hook 链，后续仍会选 mount 表；这不影响结果，因为两套表的 `useContext` 都指向同一个 `readContext`。官方 React 还有重渲染 Dispatcher、开发期 Dispatcher、render phase update 等分支，不能把这里的两张表当作官方实现的全部。
+
+下一章将进入 `useState` 和 `useReducer` 共用的更新队列：`setState` 为什么只入队，以及这些 action 何时真正变成新状态。
 
 ## 面试复习
 
-### 一句话结论
+**一句话：** Hook 没有显式 key，React 用稳定调用顺序把本轮第 N 次调用与旧链第 N 格对齐；Dispatcher 决定这次调用走 mount 还是 update 实现。
 
-Hook 以调用顺序为身份，混排在函数组件 Fiber 的单向链表中；Dispatcher 让同一个公开 API 在首次渲染和更新时分别走 `mount*` 与 `update*`。
+**为什么不能在 `if` 中调用 Hook？** 条件变化会改变后续 Hook 的序号，位置身份随之错位；报错只是保护措施，根因是链表按顺序对齐。
 
-### 面试回答（为什么→机制→仓库落点→官方差异）
+**current 和 wip 共用什么？** 当前仓库更新时创建新的 Hook 节点，复制状态字段，并复用状态 Hook 的 `queue`；current 链主要作为已提交的对齐来源。
 
-为什么：Hook API 没有显式 key，需要用稳定调用顺序把本轮调用与上轮状态逐格对齐。机制：mount 新建 Hook 并接到 wip 链尾；update 从 current 链逐格克隆到 wip，复用 queue；`renderWithHooks` 根据 current 是否已有链表选择 Dispatcher。仓库落点：`mountWorkInProgressHook`、`updateWorkInProgressHook` 和两套 `HooksDispatcher` 都在 `hooks.ts`。官方差异：官方 Hook 节点和 Dispatcher 分工相同，但还处理更多 Hook、render phase update、重渲染 Dispatcher 与开发期顺序校验。
+**`useContext` 在哪？** 它通过 Dispatcher 读取 Context，但不占普通 Hook 格，依赖记录在 `fiber.dependencies`。
 
-### 常见追问
+**源码入口：**
 
-**Q：为什么不能在 `if` 中调用 Hook？**
-A：更新按第 N 次调用对齐第 N 格；条件变化会让后续 Hook 错位。本仓库多调用会抛错，少调用还没有完整的官方开发期校验。
-
-**Q：current Hook 会被本轮直接修改吗？**
-A：通常作为对齐来源，wip 克隆新 Hook；但 `useState` 合并 pending 时会把 `baseQueue` 写回 current，以便并发 Render 被丢弃后重放。
-
-**Q：为什么 `react` 包不直接实现 `useState`？**
-A：公开 API 只从 `ReactCurrentDispatcher.current` 分发，实际 Fiber 链表逻辑留在 reconciler，避免反向依赖。
-
-### 容易说错
-
-- 不要说每种 Hook 各有一条链；本仓库的 state、effect、layout effect 混在同一条链。
-- 不要把 Dispatcher 说成调度任务的 Scheduler；它只是 Hook API 的当前实现表。
-- 不要说更新复用同一个 Hook 对象；本仓库克隆 Hook，但复用其中的 queue。
-
-### 源码入口
-
-- `packages/react-reconciler/src/hooks.ts`：`mountWorkInProgressHook`
-- `packages/react-reconciler/src/hooks.ts`：`updateWorkInProgressHook`
+- `packages/react-reconciler/src/hooks.ts`：`mountWorkInProgressHook`、`updateWorkInProgressHook`
 - `packages/react-reconciler/src/hooks.ts`：`renderWithHooks`、`HooksDispatcherOnMount`、`HooksDispatcherOnUpdate`
+- `packages/react-reconciler/src/hooks.ts`：`readContext`
 - `packages/react/src/ReactHooks.ts`：`resolveDispatcher`
 
 ---

@@ -2,195 +2,209 @@
 
 [← 返回总目录](../../React设计与实现.md) · [上一章](./14-Hook链表与Dispatcher.md) · [下一章 →](./16-useEffect与useLayoutEffect.md)
 
-> 主文件：`packages/react-reconciler/src/hooks.ts`、`scheduleUpdate.ts`
-> `setState` 不立刻改 `hook.memoizedState`。它先入队，再标 lane，等下次 Render 在 `updateState` 里算新值。
+调用 `setCount(count + 1)` 后，当前函数里的 `count` 为什么没有立刻变化？连续调用三次时，为什么传普通值常得到 `1`，传更新函数却能得到 `3`？关键在于：`setState` 不直接修改状态。它只把一条 action 放进队列并请求调度，真正的新状态要到后续 render 才按入队顺序算出。
+
+> 源码入口：`packages/react-reconciler/src/hooks.ts`、`packages/react-reconciler/src/fiberLanes.ts`、`packages/react-reconciler/src/scheduleUpdate.ts`
 
 ## 本章书签
 
-- [15.1 一格 Hook 里存什么](#151-一格-hook-里存什么)
-- [15.2 环形 pending 队列](#152-环形-pending-队列)
-- [15.3 连续三次更新推演](#153-连续三次更新推演)
-- [15.4 调度一次更新](#154-调度一次更新)
+- [15.1 setState 先入队，不直接改值](#151-setstate-先入队不直接改值)
+- [15.2 render 按顺序消费 state 与 reducer 队列](#152-render-按顺序消费-state-与-reducer-队列)
+- [15.3 Lane 决定何时调度，不筛选单条 Update](#153-lane-决定何时调度不筛选单条-update)
 - [面试复习](#面试复习)
 
 ---
 
-## 15.1 一格 Hook 里存什么
+## 15.1 setState 先入队，不直接改值
 
-`useState` 占用的那一格：
+从一个可以预测结果的例子开始：
 
-```text
-hook.memoizedState  → 当前渲染用的值（0、{…}、数组…）
-hook.queue          → { pending, dispatch }
-hook.baseQueue      → 已从 pending 截过来、尚未算完的环形链表
-hook.next           → 下一格 Hook
+```tsx
+function Counter() {
+  const [count, setCount] = useState(0);
+
+  function handleClick() {
+    setCount(count + 1);
+    console.log(count); // 仍是 0
+  }
+
+  return <button onClick={handleClick}>{count}</button>;
+}
 ```
 
-`mountState`：
+`handleClick` 是本次 render 创建的函数，其中的 `count` 已经是这次 render 的快照。`setCount` 不会改写这个局部变量，也不会当场改 `hook.memoizedState`。当前仓库的 `dispatchSetState` 只把参数交给 `enqueueUpdate`。
 
-1. 追加一格空 Hook。
-2. `initialState` 若是函数，先调用一次当初始值（lazy init），否则直接用。
-3. new 一个 `queue`，`dispatch` 闭包绑死**这一格的 fiber 和 queue**。
-4. 返回 `[memoizedState, dispatch]`。
-
-之后每次更新复用同一个 `dispatch`（`queue` 跟着 Hook 克隆复用）。所以事件处理函数里拿到的 `setCount` 引用稳定，不必进 `useEffect` 的 deps——本仓库没有 `useCallback`，这一点仍然值得知道。
-
-`updateState` 不再看 `initialState` 参数。新值只来自队列里的 action。
-
-## 15.2 环形 pending 队列
-
-`dispatchSetState` 把一次更新收成 `{ action, next }`，接进 `queue.pending`。这是**环形链表**，`pending` 指向**最后插入**的那条，`pending.next` 才是最老的：
-
-```text
-第一次 setState(1)
-  pending ──► U1 ──next──► U1
-
-再 setState(v => v + 1)
-  U1.next = U2, U2.next = U1
-  pending ──► U2
-               next
-                ▼
-               U1 ──► U2
-```
-
-同一事件里连点三次，三次都先入队，**不会**同步改界面。`scheduleUpdateOnFiber` 用 `DefaultLane` 约一次工作；`ensureRootIsScheduled` 对同一档只保留一个回调，三次更新在同一轮 `updateState` 里消化。
-
-`updateState` 算值：
-
-1. 把 `queue.pending` 接到 `baseQueue` 上（都是环形；有两边则 `mergeCircularQueues`）。
-2. 写回 `current.baseQueue`，`pending` 清空。若本轮被切片重启丢掉 WIP，下次还能从 current 重放。
-3. 从 `baseQueue.next`（最老）走到一圈，对每个 action：函数则 `(prev) => next`，否则当新值。
-4. 结果写入 `hook.memoizedState`，`baseQueue` 置空。
+一条更新的结构很小：
 
 ```ts
-setCount(1);
-setCount((v) => v + 1);
-// 若当前是 0：先变成 1，再变成 2。顺序就是入队顺序。
+type Update<S> = {
+  action: S | ((prev: S) => S);
+  next: Update<S>;
+};
 ```
 
-`Object.is` 相同是否跳过更新，本仓库没有做——每次 `setState` 都会调度。教学上先把队列和 lane 讲清。
+`action` 有两种形式：
 
-## 15.3 连续三次更新推演
+- 普通值，例如 `setCount(1)`，消费时直接把状态替换为 `1`；
+- 更新函数，例如 `setCount(n => n + 1)`，消费时把当时的中间状态传给函数。
 
-假设本次事件闭包里的 `count` 是 `0`：
-
-```ts
-setCount((v) => v + 1);
-setCount((v) => v + 1);
-setCount((v) => v + 1);
-```
-
-三次 `dispatchSetState` 形成环：
+新 Update 会进入 `hook.queue.pending` 所指的环形链表。`pending` 指向最新插入的尾节点，`pending.next` 才是最早的头节点：
 
 ```text
-pending → U3（尾）
-           │
-           ▼
-          U1 → U2 → U3
-           ▲         │
-           └─────────┘
+第一次入队 U1：
 
-U1.action = v => v + 1
-U2.action = v => v + 1
-U3.action = v => v + 1
+pending
+   │
+   ▼
+  U1 ──next──► U1
+
+再入队 U2：
+
+pending
+   │
+   ▼
+  U2 ──next──► U1 ──next──► U2
+               ▲             │
+               └─────────────┘
 ```
 
-`updateState` 从 `pending.next`，也就是最老的 U1 开始走一圈：
+这种结构让插入保持简单：空队列让新节点指向自己；非空队列则把新节点插在旧尾与旧头之间，再让 `pending` 指向新尾。读取时从 `pending.next` 开始，正好仍按先进先出的顺序处理。
 
-```text
-newState = 0
-U1：action(0) = 1
-U2：action(1) = 2
-U3：action(2) = 3
-最终 hook.memoizedState = 3
-```
+`mountState` 创建的 `dispatch` 闭包会捕获当前 Fiber 和这一个共享 `queue`。更新渲染虽然会克隆 Hook 节点，却复用 `queue`，所以 `setCount` 的函数身份保持稳定。此时队列中只是“以后怎样更新”的描述，状态值尚未改变。
 
-若改成三次非函数式更新：
+## 15.2 render 按顺序消费 state 与 reducer 队列
 
-```ts
+下一次 render 调用 `updateState` 时，才会处理积累的 action。流程分为四步：
+
+1. 取得 `queue.pending`；若已有 `baseQueue`，用 `mergeCircularQueues` 把两个环接成一个环。
+2. 把合并结果写到 current Hook 的 `baseQueue`，并清空 `queue.pending`。若本轮 wip 被放弃，下次仍可从 current 找回这些更新。
+3. 从 `baseQueue.next`，也就是最老的 Update 开始走一圈，逐条计算。
+4. 把最终结果写入 wip Hook 的 `memoizedState`，并清空已消费的 `baseQueue`。
+
+普通值与函数 action 的差异，现在就能准确解释。假设事件处理函数闭包中的 `count` 是 `0`：
+
+```tsx
 setCount(count + 1);
 setCount(count + 1);
 setCount(count + 1);
 ```
 
-三行都读取**同一次渲染闭包**里的 `count = 0`，所以入队的三个 action 都已经是普通值 `1`。本仓库遇到非函数 action 会直接覆盖 `newState`：
+三行表达式在入队前都已经读取了同一个 `count`，所以队列实际收到的是三个普通值 `1`：
 
 ```text
-newState = 0
-U1：newState = 1
-U2：newState = 1
-U3：newState = 1
-最终结果 = 1
+初值 0
+  → U1.action 是 1：替换为 1
+  → U2.action 是 1：替换为 1
+  → U3.action 是 1：替换为 1
+最终结果 1
 ```
 
-差别不在「有没有入队」：两种写法都会入队三次，也都会调用三次调度入口；同档 `DefaultLane` 只保留一个 Scheduler 回调。真正差别是消费队列时，函数式 action 接收前一条算出的 `newState`，普通值 action 只会把它覆盖为闭包提前算好的相同值。本仓库没有 eager state、批处理边界或按 Lane 跳过单条 Update，这个推演只依赖当前 `updateState` 的顺序归约。
+改成更新函数：
 
-## 15.4 调度一次更新
+```tsx
+setCount(n => n + 1);
+setCount(n => n + 1);
+setCount(n => n + 1);
+```
 
-入队之后立刻：
+队列保存的是三个函数。每个函数都接收前一条刚算出的结果：
+
+```text
+初值 0
+  → U1.action(0) 得 1
+  → U2.action(1) 得 2
+  → U3.action(2) 得 3
+最终结果 3
+```
+
+两种写法都入队三条 Update。差别不是“是否批处理”，而是 action 在 render 中如何归约。当前仓库也没有在入队时做 `Object.is` eager bailout；即使传入与旧状态相同的值，仍会入队和调度。
+
+`useReducer` 使用同一种环形队列。它与 `useState` 的主要区别不是队列形状，而是消费 action 的方式：
 
 ```ts
-scheduleUpdateOnFiber(fiber, DefaultLane);
+// useState 的概念模型
+nextState =
+  typeof action === 'function' ? action(prevState) : action;
+
+// useReducer
+nextState = reducer(prevState, action);
 ```
 
-`scheduleUpdate.ts` 是一层间接：`workLoop` 启动时把 `scheduleUpdateOnFiberImpl` 注入进来，避免 `hooks.ts` 和 `workLoop.ts` 循环 import。
+`mountReducer` 同样创建 `{ pending, dispatch, lastRenderedReducer }`，`updateReducer` 同样合并 `pending` 与 `baseQueue`，再按入队顺序遍历。只是每一条 action 都交给组件提供的 `reducer`。因此可以把 `useState` 和 `useReducer` 看成“共用队列机制，采用不同状态计算规则”，而不是两套独立调度系统。
 
-`scheduleUpdateOnFiberImpl` 三件事：
+## 15.3 Lane 决定何时调度，不筛选单条 Update
 
-1. **`markUpdateLaneFromFiberToRoot`**：这个 Fiber 的 `lanes |= DefaultLane`，沿 `return` 给祖先 `childLanes` 也或上；`alternate` 同样标。
-2. **`root.pendingLanes` 合并** 这一档。
-3. **若正在 render 同一 root，且新更新同档或更高优** → `rootNeedsRestart = true`，半成品 WIP 丢掉。然后 `ensureRootIsScheduled`。
+action 入队之后，`enqueueUpdate` 会调用：
+
+```ts
+scheduleUpdateOnFiber(fiber, requestUpdateLane());
+```
+
+当前仓库的 `requestUpdateLane` 只看 `ReactCurrentBatchConfig.transition`：
+
+```ts
+function requestUpdateLane(): Lane {
+  return ReactCurrentBatchConfig.transition != null
+    ? TransitionLane
+    : DefaultLane;
+}
+```
+
+因此，普通事件中的 `setState` 请求 `DefaultLane`；`startTransition` 回调内的 `setState` 请求更低优先级的 `TransitionLane`。
+
+```tsx
+setInput(text); // DefaultLane
+
+startTransition(() => {
+  setQuery(text); // TransitionLane
+});
+```
+
+Lane 在这里描述“这次更新请求以什么优先级让 root 工作”。`DefaultLane` 可以交给 Scheduler 做可切片渲染；`TransitionLane` 会等更高优工作完成，也可以被更高优更新打断。`root.render` 使用的 `SyncLane` 是另一条入口，不是 Hook 的 `setState` 在普通情况下选择的 Lane。
+
+但必须区分**调度 Lane**与**队列中的单条 Update**。当前教学实现的 Update 只有 `action` 和 `next`，没有 `lane` 字段：
 
 ```text
-setCount
-  → 入队（环形 pending）
-  → 从 Fiber 标到 HostRoot
-  → pendingLanes |= DefaultLane
-  → Scheduler 宏任务
-  → beginWork(App) → updateState 算出新 count
-  → Diff 子树（文本「count: N」打 Update）
-  → commit 改 DOM
+Update = { action, next }       // 没有 lane
+root.pendingLanes = ...         // Lane 记在调度路径上
 ```
 
-`root.render` 走的是 `SyncLane`，不进这条 `dispatchSetState`。用户事件一律 Default，才能切片、才能被随后的 Sync 插队。细节见第 18 章。
+这意味着当前 render 一旦进入 `updateState` 或 `updateReducer`，就会消费队列中的全部 action，不会依据本轮 `renderLanes` 跳过某一条低优更新。`baseQueue` 在这里主要用于渲染被中断或丢弃后的重放，不是完整的“跳过低优更新并在以后 rebase”实现。
 
-下一章：同一条 Hook 链表上的另一种格子——`useEffect` / `useLayoutEffect`。
+这个边界会产生一个重要结论：即使某条 action 是在 `startTransition` 内入队，它自身也没有永久携带 `TransitionLane`。Lane 让 root 以 Transition 优先级获得一次调度机会；若另一条 Default 更新先触发了 render，当前简化实现可能在这轮中把队列里的 action 一并消费。
+
+官方 React 的状态 Update 会携带 lane，render 可以跳过不属于当前优先级的更新，并用 `baseState`、`baseQueue` 保留与重放，另外还有 eager state、并发入队等机制。因此，“Transition action 永远只在 Transition render 中处理”不能从当前仓库推出；反过来，也不能用当前仓库的全量消费去描述官方 React。
+
+完整路径可以概括为：
+
+```text
+setState(action)
+  → action 接到 queue.pending 环形队列
+  → requestUpdateLane：普通为 Default，transition 内为 Transition
+  → scheduleUpdateOnFiber
+  → 后续 render 调用 updateState / updateReducer
+  → 从最老 action 开始消费整条队列
+  → 新状态写入 wip Hook，commit 后对界面生效
+```
+
+下一章将查看同一条 Hook 链上的 effect 格子，以及 `useEffect` 和 `useLayoutEffect` 在 commit 时机上的区别。
 
 ## 面试复习
 
-### 一句话结论
+**一句话：** `setState` 先把值或更新函数放入环形队列，再请求一次 Lane 调度；状态到后续 render 才按入队顺序计算。
 
-`setState` 先把 action 追加到环形队列，再以 `DefaultLane` 调度；Render 时从最老更新顺序归约，所以连续三个函数式 `+1` 从 0 得 3，三个同闭包的 `count + 1` 得 1。
+**为什么三次 `setCount(count + 1)` 得 1？** 三次都从同一 render 闭包读到 `0`，入队的是三个值 `1`；函数 action 才会接收前一条的中间结果。
 
-### 面试回答（为什么→机制→仓库落点→官方差异）
+**`useReducer` 是另一种队列吗？** 不是。当前仓库复用同样的 Update 环和合并流程，只把每条 action 交给 reducer。
 
-为什么：状态更新可能连续发生，也可能因时间切片被重启，不能在调用 `setState` 时直接改当前 Hook。机制：`pending` 指向环形队列尾，`pending.next` 是队首；Render 合并到 `baseQueue` 后按入队顺序消费，函数 action 用前一结果，普通 action 直接替换结果。仓库落点：`dispatchSetState` 入队，`mergeCircularQueues` 合并，`updateState` 归约并把队列写回 current 保障重放。官方差异：官方还支持 eager state、按 Lane 跳过与 rebase、批处理等；本仓库所有 state update 都是 DefaultLane，且每次调用都会进入调度。
+**Transition 更新会被单独筛选吗？** 不会。`requestUpdateLane` 会为调度选择 `TransitionLane`，但单条 Update 没有 lane，当前 render 会消费全队列；官方 React 才有按 Update lane 跳过与 rebase。
 
-### 常见追问
+**源码入口：**
 
-**Q：连续三次 `setState` 是只入队一次吗？**
-A：不是，入队三条 Update、调用三次调度入口；只是同一根同一 Lane 已有回调时不重复预约任务。
-
-**Q：为什么 `setCount(count + 1)` 三次不是 3？**
-A：三次都在同一闭包中先算成相同普通值，消费时连续覆盖；函数式 action 才会逐条拿到最新中间结果。
-
-**Q：为什么把队列写回 current 的 `baseQueue`？**
-A：若并发 Render 的 wip 被插队丢弃，current 仍保留已转移的更新，下次可从已提交状态重新推演。
-
-**Q：相同新值会在入队时被跳过吗？**
-A：本仓库不会做 `Object.is` eager bailout，每次都会入队并调度。
-
-### 容易说错
-
-- 不要说 `setState` 立即修改 `memoizedState`；真正计算发生在后续 `updateState`。
-- 不要把 `pending` 当队首；它指向队尾，`pending.next` 才是最老更新。
-- 不要把本仓库的简单归约描述成官方完整的 Lane 跳过与 rebase 算法。
-
-### 源码入口
-
-- `packages/react-reconciler/src/hooks.ts`：`dispatchSetState`
-- `packages/react-reconciler/src/hooks.ts`：`mergeCircularQueues`、`updateState`
-- `packages/react-reconciler/src/workLoop.ts`：`scheduleUpdateOnFiberImpl`、`ensureRootIsScheduled`
+- `packages/react-reconciler/src/hooks.ts`：`enqueueUpdate`、`requestUpdateLane`
+- `packages/react-reconciler/src/hooks.ts`：`mergeCircularQueues`、`updateState`、`updateReducer`
+- `packages/react-reconciler/src/fiberLanes.ts`：`DefaultLane`、`TransitionLane`
+- `packages/react-reconciler/src/scheduleUpdate.ts`：`scheduleUpdateOnFiber`
 
 ---
 
