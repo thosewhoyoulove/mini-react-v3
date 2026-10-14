@@ -19,26 +19,11 @@
 
 命令式就是逐步告诉浏览器怎么做：找到节点、改文本、插入、清空。浏览器原生 API 全是这一套。
 
-下面这段不是仓库里的文件。它把 hello-dom 的列表实验改写成纯 DOM，用来看痛点长在哪。列表一开始是 `A`、`B`、`C`。
+下面这段不是仓库里的文件。它只把 hello-dom 的 reverse 改写成纯 DOM，用来看痛点长在哪。假设页面上已经有一个 `<ul>`，里面依次是 `A`、`B`、`C`：
 
 ```js
-const countEl = document.querySelector('.count');
 const listEl = document.querySelector('ul');
-let count = 0;
 let items = ['A', 'B', 'C'];
-
-document.querySelector('.plus').onclick = () => {
-  count += 1;
-  countEl.textContent = 'count: ' + count;
-};
-
-document.querySelector('.add').onclick = () => {
-  const item = 'item-' + items.length;
-  items = items.concat(item);
-  const li = document.createElement('li');
-  li.textContent = item;
-  listEl.appendChild(li);
-};
 
 document.querySelector('.reverse').onclick = () => {
   items = items.slice().reverse();
@@ -51,14 +36,13 @@ document.querySelector('.reverse').onclick = () => {
 };
 ```
 
-能跑。reverse 一写，问题就具体了：
+点击后，数组和页面都变成 `C`、`B`、`A`。结果没有问题，代价藏在实现里：
 
 1. **两套真相。** `items` 在 JS 里一份，`<li>` 在文档里又一份。reverse 里如果忘了 `innerHTML = ''`，数组已经倒过来，屏幕还是旧顺序。
-2. **同一种「列表变了」，三条路径。** `+1` 改文本，`add` 只 append，`reverse` 清空再建。再加「删第一项」「改某一项文案」，每种交互都要新写一段 DOM 步骤。
-3. **reverse 用清空换正确，把节点身份一起倒掉。** `innerHTML = ''` 会拆掉现有 `<li>`。某一项里如果有输入框，焦点和已经输入的文字一起没了。想留下原来的节点，就得自己记「`A` 对应哪个 DOM」，再算它该插到谁前面。这正是第 10 章要收进框架的事；在命令式里，它堆在按钮回调里。
-4. **读代码时要模拟过程。** 看这个 onclick，要想的是会执行哪几条 DOM API，而不是点完以后列表是 `C B A`。
+2. **reverse 用清空换正确，把节点身份一起倒掉。** `innerHTML = ''` 会拆掉现有 `<li>`。某一项里如果有输入框，焦点和已经输入的文字一起没了。想留下原来的节点，就得自己记「`A` 对应哪个 DOM」，再算它该插到谁前面。这正是第 10 章要收进框架的事；在命令式里，它堆在按钮回调里。
+3. **每种变化都要另写过程。** reverse 选择清空再建；追加通常只需 `appendChild`；删除中间项又要先找到对应节点。同样是「列表变了」，业务代码要维护多条 DOM 路径。
 
-页面只有三个按钮时还能对得上。状态一交叉，漏同步就变成主要的 bug。
+只有一个按钮时还能对得上。交互一多，漏同步就变成主要的 bug。
 
 ## 1.2 声明式：业务只交出下一份描述
 
