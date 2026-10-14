@@ -4,28 +4,28 @@
 
 ---
 
-前端框架要解决的，往往不是「能不能改 DOM」，而是「状态变了之后，DOM 该怎么跟着变，而且别写乱」。本章用同一类需求，对比命令式与声明式两条路，并说明教学版 React 站在哪一侧、代价是什么。
+同一份列表，可以在点击回调里手写每一次 DOM 改动，也可以只交出「按当前状态，界面应该长什么样」。本章用 `demos/hello-dom` 里的 reverse 把这两条路走完。Fiber、Diff、调度先不展开；它们是后面用来付这一章账单的。
 
 ## 本章书签
 
-- [1.1 命令式操作 DOM 的痛点](#11-命令式操作-dom-的痛点)
-- [1.2 声明式：用数据描述界面，把「怎么改 DOM」交给框架](#12-声明式用数据描述界面把怎么改-dom交给框架)
-- [1.3 性能、心智负担与可控性之间的取舍](#13-性能心智负担与可控性之间的取舍)
+- [1.1 命令式：每次点击都要自己把数据和 DOM 对齐](#11-命令式：每次点击都要自己把数据和-dom-对齐)
+- [1.2 声明式：业务只交出下一份描述](#12-声明式：业务只交出下一份描述)
+- [1.3 省下来的步骤会变成框架的账单](#13-省下来的步骤会变成框架的账单)
 - [面试复习](#面试复习)
 
 ---
 
-## 1.1 命令式操作 DOM 的痛点
+## 1.1 命令式：每次点击都要自己把数据和 DOM 对齐
 
-命令式的意思是：你逐步告诉浏览器**怎么做**——找到节点、改文本、插子节点、绑事件。浏览器原生 API 全是这一套。
+命令式就是逐步告诉浏览器怎么做：找到节点、改文本、插入、清空。浏览器原生 API 全是这一套。
 
-假设页面上有一个计数和一串列表，要点按钮加一、追加一项、或把列表倒序。纯命令式大致是这样：
+下面这段不是仓库里的文件。它把 hello-dom 的列表实验改写成纯 DOM，用来看痛点长在哪。列表一开始是 `A`、`B`、`C`。
 
 ```js
 const countEl = document.querySelector('.count');
 const listEl = document.querySelector('ul');
 let count = 0;
-let items = ['Fiber', 'Diff', 'Hooks'];
+let items = ['A', 'B', 'C'];
 
 document.querySelector('.plus').onclick = () => {
   count += 1;
@@ -33,9 +33,10 @@ document.querySelector('.plus').onclick = () => {
 };
 
 document.querySelector('.add').onclick = () => {
-  items = items.concat('item-' + items.length);
+  const item = 'item-' + items.length;
+  items = items.concat(item);
   const li = document.createElement('li');
-  li.textContent = items[items.length - 1];
+  li.textContent = item;
   listEl.appendChild(li);
 };
 
@@ -50,36 +51,28 @@ document.querySelector('.reverse').onclick = () => {
 };
 ```
 
-这段代码能跑，但有几处很快会疼：
+能跑。reverse 一写，问题就具体了：
 
-1. **状态与 DOM 两套真相。** `count` / `items` 在 JS 里一份，屏幕上又一份。每次改状态都要手写「同步到 DOM」的步骤；漏一步，界面就和数据对不上。
-2. **更新路径随交互分裂。** `+1` 只改文本，`add` 只 append，`reverse` 却清空再建。同一种「列表变了」，三种写法；需求再多一点（删除中间项、改某一项文案），分支会继续膨胀。
-3. **复用与移动难写对。** reverse 用 `innerHTML = ''` 最省事，但会拆掉已有 DOM、丢掉焦点和内部状态。若要「尽量移动已有节点」，就得自己维护 key、找旧节点、算插入位置——这正是后面 Diff 章要解决的问题，命令式里全堆在业务代码里。
-4. **心智负担在「过程」。** 读代码时要想的是「这次点击会执行哪几条 DOM API」，而不是「点完之后界面应该长什么样」。
+1. **两套真相。** `items` 在 JS 里一份，`<li>` 在文档里又一份。reverse 里如果忘了 `innerHTML = ''`，数组已经倒过来，屏幕还是旧顺序。
+2. **同一种「列表变了」，三条路径。** `+1` 改文本，`add` 只 append，`reverse` 清空再建。再加「删第一项」「改某一项文案」，每种交互都要新写一段 DOM 步骤。
+3. **reverse 用清空换正确，把节点身份一起倒掉。** `innerHTML = ''` 会拆掉现有 `<li>`。某一项里如果有输入框，焦点和已经输入的文字一起没了。想留下原来的节点，就得自己记「`A` 对应哪个 DOM」，再算它该插到谁前面。这正是第 10 章要收进框架的事；在命令式里，它堆在按钮回调里。
+4. **读代码时要模拟过程。** 看这个 onclick，要想的是会执行哪几条 DOM API，而不是点完以后列表是 `C B A`。
 
-小页面还能扛；组件一多、状态交叉一多，命令式同步就会变成主要的 bug 来源。
+页面只有三个按钮时还能对得上。状态一交叉，漏同步就变成主要的 bug。
 
-## 1.2 声明式：用数据描述界面，把「怎么改 DOM」交给框架
+## 1.2 声明式：业务只交出下一份描述
 
-声明式换了一种问法：你只描述**现在应该长什么样**（由当前状态推导出的 UI 树），不写「相对上一帧该 insert 还是 remove」。框架负责对比前后两次描述，再去改 DOM。
+声明式换一个问题：根据当前状态，界面现在应该长什么样。回调里不写「相对上一帧是 insert 还是 remove」。
 
-用本仓库 demo 里同款需求，声明式写法是（见 `demos/hello-dom/src/main.ts`）：
+仓库里对应的是 `ListDemo`（`demos/hello-dom/src/main.ts`）。下面只留状态、倒序按钮和列表，标题与断点提示省掉：
 
 ```js
-function App() {
-  const [count, setCount] = useState(0);
-  const [items, setItems] = useState(['Fiber', 'Diff', 'Hooks']);
+function ListDemo() {
+  const [items, setItems] = useState(['A', 'B', 'C']);
 
   return createElement(
-    'div',
-    { className: 'app' },
-    createElement('p', null, 'count: ' + count),
-    createElement('button', { onClick: () => setCount((v) => v + 1) }, '+1'),
-    createElement(
-      'button',
-      { onClick: () => setItems((list) => list.concat('item-' + list.length)) },
-      'add',
-    ),
+    'section',
+    { className: 'card' },
     createElement(
       'button',
       { onClick: () => setItems((list) => list.slice().reverse()) },
@@ -94,87 +87,85 @@ function App() {
 }
 ```
 
-注意几点：
+同一文件里的 `StateDemo` 是更小的同一形状：`count` 放在 `useState` 里，`+1` 只调用 `setCount((value) => value + 1)`，返回值里写 `'count: ' + count`。没有 `querySelector`，也没有 `textContent`。
 
-- **没有** `querySelector`、`appendChild`、`innerHTML`。函数的返回值是一棵 **ReactElement 树**（数据），不是已经挂好的 DOM。
-- 三个按钮都只改状态：`setCount` / `setItems`。下一次渲染时，`App` 再跑一遍，根据**新的** `count`、`items` 重新描述整棵子树。
-- 「列表倒序时节点是移动还是重建」不写在业务里，而由调和器按 `key` + `type` 去算（第 10 章）。业务侧只保证：同一项用稳定的 `key`。
-
-可以把关系写成：
+函数的返回值是一棵 **ReactElement**，普通对象，还不是 DOM。`createElement` 怎么造这棵对象，第 4 章再拆。本章先把分工看清：
 
 ```text
-状态 (count, items)
-    │
-    ▼
-UI 描述 (ReactElement 树)     ← 你写的是这一层
-    │
-    ▼
-框架：Diff + 打 flags + Commit
-    │
-    ▼
+items = ['C', 'B', 'A']          按钮只改这一份数据
+        │
+        ▼
+ReactElement 树                  ListDemo 再次执行后的返回值
+        │
+        ▼
+框架算出哪些 <li> 留下、移动、删除
+        │
+        ▼
 真实 DOM
 ```
 
-从第 4 章起会看到：`createElement` 造的是带 `$$typeof` 的普通对象；真正碰 `document` 发生在 Commit。声明式并不是「不用 DOM」，而是**把 DOM 操作收进框架的固定管线**，让应用代码只关心状态到视图的映射。
+reverse 只把数组倒过来。下一次 `ListDemo` 按新数组再描述一遍。`<li>` 是移动还是拆掉重建，业务代码里没有答案；`key: item` 是交给后面调和器用的身份。第 10 章会看到，稳定的 `key` 让 `A` 还是原来那个 `A`。这里只要记住：声明式把「怎么改 DOM」从按钮里拿了出去，框架必须在别处把它做对。
 
-## 1.3 性能、心智负担与可控性之间的取舍
+页面入口在 `main.ts` 末尾，仍然很短：
 
-声明式不是免费的。框架至少多做三件事：维护组件树 / Fiber、对比新旧描述、再批量改 DOM。相对「我精确知道只改这一个 `textContent`」，多了一层间接。
+```ts
+createRoot(container).render(createElement(App, null));
+```
 
-常见取舍可以摊开看：
+`App` 把 `StateDemo`、`ListDemo` 等卡片拼在一起。第一次画到屏幕上，走的是 `render`；之后点 reverse，走的是 `setItems`。两条入口，同一种「交出下一份描述」。
 
-| 维度 | 命令式 | 声明式（React 这类） |
+## 1.3 省下来的步骤会变成框架的账单
+
+声明式没有取消 DOM 操作，只是把它们从业务回调挪到框架里。相对「我知道这次只改一个 `textContent`」，每次更新至少多做三件事：再执行组件函数、得到一棵新的描述、再决定哪些真实节点要动。
+
+| | 命令式回调 | 声明式组件 |
 | --- | --- | --- |
-| 心智负担 | 每次更新要想清 DOM 步骤 | 想清「状态 → UI」；更新细节交给框架 |
-| 正确性 | 易漏同步、易出现半更新 | 同一套 reconcile / commit，路径统一 |
-| 性能上限 | 可以精确到单次 DOM 操作 | 依赖 Diff 与批更新；写不好会多渲染 |
-| 可控性 | 每一步都手控 | 默认放弃细粒度 DOM 操控；特殊需求要靠 escape hatch |
+| 作者要写对的事 | 这次点击的 DOM 步骤 | 当前状态对应的界面 |
+| 漏一步的后果 | 数据和屏幕分叉，而且每种交互漏法不同 | 描述错了，这次更新就按错误描述走 |
+| 性能上限 | 可以精确到一次 DOM 调用 | 取决于框架会不会把「描述变了」做成「DOM 全拆掉」 |
+| 放弃的控制 | 没有 | 默认不再手写插入点；测量、焦点、媒体控制仍要自己做 |
 
-几点澄清，避免把「声明式」神化：
+「用了框架就会变慢」说得太满，「虚拟 DOM 一定更快」也不成立。精确改一次文本，常数成本更低。声明式先换来的是：倒序、追加、删除走同一条更新路径，不会在第三个按钮里偷偷 `innerHTML = ''`。它能不能接近手写 DOM 的成本，取决于后面几章做不做这三件事：复用已有节点、算到一半时不改屏幕、大树不要一次占满主线程。
 
-1. **声明式也可以很快。** 慢通常不是因为「用了框架」，而是描述变了却做了不必要的子树重算，或列表没有稳定 `key` 导致大量误删误建。本仓库的 keyed Diff、双缓冲、时间切片，都是在声明式前提下把成本压回去。
-2. **命令式并没有消失。** HostConfig 里照样 `createElement`、`appendChild`、改属性；只是调用方从业务变成了 reconciler 的 commit 阶段。学原理时，命令式 DOM 知识仍然有用，只是出场位置变了。
-3. **教学版站在「可讲清」一侧。** mini-react 刻意走完整的「描述 → 调和 → 提交」路径，而不是在业务里手写最小 DOM 补丁。这样后面讲 Fiber、flags、Hooks 时，有一条统一故事线；代价是实现量和运行时开销都大于「几十行直接操作 DOM 的 demo」。
+命令式 API 还在。`document.createElement`、`appendChild` 会出现在 `packages/react-dom` 的宿主实现里，调用方从业务变成提交阶段。这些 API 仍然要会，只是不再散落在每个按钮上。
 
-第 1 章的结论可以收成一句话：**声明式把「界面是什么」留给应用，把「怎么改到那一步」留给框架；框架的设计，就是在心智负担、正确性与性能之间做可持续的权衡。** 下一章会具体说：为了撑住这条路径，教学版至少要具备可中断更新、双缓冲、宿主无关这几块能力。
+本章收到这里：应用代码保留「界面是什么」，框架接过「怎样改到那一步」。下一章看，如果框架用最省事的办法接——清空容器，再按描述重建——会立刻坏在哪三件事上。
 
 ## 面试复习
 
 ### 一句话结论
 
-React 的声明式不是消灭 DOM 操作，而是把「状态如何变成界面」留给业务，把易错的增删改步骤集中到调和与提交管线。
+声明式把易漏的 DOM 同步从每个事件回调里拿出来，收成一条「状态 → 描述 → 更新 DOM」的路径。DOM API 还在，调用方换了。
 
 ### 面试回答
 
-为什么需要声明式？因为命令式代码同时维护 JS 状态和 DOM 状态，交互一多，每条更新路径都要手动保证两者同步，容易出现遗漏和半更新。React 让组件返回 ReactElement 数据，再把更新拆成 Render 与 Commit：Render 根据新旧描述构造 Fiber、计算差异并记录 flags，Commit 才集中执行宿主操作。本仓库中，`App` 只调用 `setState` 并返回 Element；`childFiber.ts` 负责协调孩子，`commitWork.ts` 根据 flags 改 DOM，实际 DOM API 收口在 `react-dom/src/hostConfig.ts`。官方 React 的调度、优先级、事件系统和优化策略更完整，但核心权衡相同：用额外的树、比较和调度成本，换取可组合的状态到 UI 映射与统一更新路径。
+以列表倒序为例。命令式要自己把数组 reverse，再清空 `<ul>` 重建 `<li>`，清空会丢掉节点上的焦点和输入。声明式里 reverse 只调用 `setItems`，组件再返回一棵带 `key` 的元素描述，框架比较前后两份描述，决定移动还是新建。本仓库的 `ListDemo` 就是这样写的。真正碰到 `document` 的代码在 `react-dom` 的宿主实现里，不在按钮里。代价是每次更新都要重新描述界面。值不值，取决于更新路径是不是已经多到人会对不齐，而不是声明式的单次开销更小。
 
 ### 常见追问
 
-**1. 声明式一定比命令式快吗？**
+**1. 声明式一定更快吗？**
 
-不一定。精确手写一次 `textContent` 的常数成本更低；声明式的价值首先是复杂更新下的正确性和可维护性，再通过 Diff、批处理与调度控制额外成本。
+不一定。手写一次 `textContent` 更便宜。它先解决的是多种交互下数据和屏幕分叉。快不快，要看后面的 Diff 和调度有没有把多余的 DOM 操作省掉。
 
-**2. React 为什么还需要 `key`？**
+**2. 为什么列表还要 `key`？**
 
-声明式只说明下一棵树长什么样，`key` 补充了列表项跨两次渲染的身份，使框架能判断复用、移动还是删除，而不是把相同位置误当成同一项。
+描述只说下一帧有哪些项，不说「这一项是上一帧的哪一项」。`key` 补上这个身份。没有它，倒序很容易被当成每个位置的文本都变了。
 
-**3. 可以完全不碰命令式 API 吗？**
+**3. 业务代码还能碰 DOM 吗？**
 
-不能。焦点、测量、媒体控制等仍需命令式逃生口；区别是普通 UI 更新不再把 DOM 同步逻辑散落到业务代码中。
+能。焦点、测量、改 `document.title` 这类事，描述树覆盖不了。hello-dom 的 Effect 实验就直接改了标题。区别是普通的列表增删改，不再每人写一套同步步骤。
 
 ### 容易说错
 
-- 不要说「React 不操作 DOM」；它在 Commit 阶段通过 HostConfig 操作 DOM。
-- 不要说「虚拟 DOM 一定更快」；它提供可预测的统一更新模型，性能取决于树规模、更新方式和实现策略。
-- 不要把「组件函数重新执行」等同于「对应 DOM 全部重建」；是否复用由后续调和结果决定。
+- React 仍然操作 DOM。发生在提交阶段，经宿主实现调用。
+- 组件函数又执行一次，不等于对应 DOM 全部拆掉重建。复用与否要等调和结果。
+- 「虚拟 DOM 更快」不是这一章的结论。这一章的结论是更新路径统一了。
 
 ### 源码入口
 
-- `demos/hello-dom/src/main.ts`：状态到 Element 的声明式示例。
-- `packages/react/src/ReactElement.ts`：创建 UI 描述数据。
-- `packages/react-reconciler/src/childFiber.ts`：比较并重建 Fiber 子链表。
-- `packages/react-reconciler/src/commitWork.ts`：把副作用落实到宿主环境。
-- `packages/react-dom/src/hostConfig.ts`：真正调用 DOM API 的宿主实现。
+- `demos/hello-dom/src/main.ts`：`ListDemo` 的 reverse，以及文件末尾的 `createRoot().render`。
+- `packages/react/src/ReactElement.ts`：描述对象的工厂，第 4 章再拆。
+- `packages/react-dom/src/hostConfig.ts`：DOM API 的实际调用点。
 
 ---
 
