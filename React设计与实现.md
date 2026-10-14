@@ -74,10 +74,10 @@ docs/react-design/
 | 6 | [Fiber 链表与双缓冲](./docs/react-design/06-Fiber链表与双缓冲.md) | 已写 |
 | 7 | [副作用标记 Flags](./docs/react-design/07-副作用标记Flags.md) | 已写 |
 | 8 | [工作循环：向下 begin、向上 complete](./docs/react-design/08-工作循环.md) | 已写 |
-| 9 | [`beginWork` 按 tag 分发](./docs/react-design/09-beginWork按tag分发.md) | 已写 |
-| 10 | [子节点 Diff：单节点与列表 key](./docs/react-design/10-子节点Diff.md) | 已写 |
-| 11 | [`completeWork` 创建实例与冒泡 flags](./docs/react-design/11-completeWork.md) | 已写 |
-| 12 | [Commit：Mutation / Layout / Passive](./docs/react-design/12-Commit三阶段.md) | 已写 |
+| 9 | [`beginWork` 怎样得到下一层 children](./docs/react-design/09-beginWork按tag分发.md) | 已写 |
+| 10 | [子节点 Diff：key 怎样决定复用与移动](./docs/react-design/10-子节点Diff.md) | 已写 |
+| 11 | [`completeWork` 为什么必须自底向上](./docs/react-design/11-completeWork.md) | 已写 |
+| 12 | [Commit：把计划变成用户看到的结果](./docs/react-design/12-Commit三阶段.md) | 已写 |
 
 ---
 

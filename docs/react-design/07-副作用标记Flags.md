@@ -2,128 +2,118 @@
 
 [← 返回总目录](../../React设计与实现.md) · [上一章](./06-Fiber链表与双缓冲.md) · [下一章 →](./08-工作循环.md)
 
-> 主文件：`packages/react-reconciler/src/fiberFlags.ts`
-> Render 只在 Fiber 上打比特位；真正碰 DOM 和跑 effect，是 Commit 按 mask 扫树。
+---
+
+列表从 `A B C` 变成 `C B A` 时，Render 已经算出哪些 Fiber 要移动。Commit 为什么不用再比较一次新旧列表？因为 Render 会把后续工作写成 flags，Commit 只负责照单执行。本章只回答三个问题：为什么先记账、每一位表示什么、Commit 怎样跳过没有工作的子树。
 
 ## 本章书签
 
-- [7.1 为什么 Render 不直接改 DOM，只打标记](#71-为什么-render-不直接改-dom只打标记)
-- [7.2 `Placement` / `Update` / `ChildDeletion` / `Passive`](#72-placement--update--childdeletion--passive)
-- [7.3 flags 如何沿树冒泡](#73-flags-如何沿树冒泡)
+- [7.1 Render 为什么只记账](#71-render-为什么只记账)
+- [7.2 一位 flag 对应一类后续工作](#72-一位-flag-对应一类后续工作)
+- [7.3 subtreeFlags 怎样剪掉空分支](#73-subtreeflags-怎样剪掉空分支)
 - [面试复习](#面试复习)
 
 ---
 
-## 7.1 为什么 Render 不直接改 DOM，只打标记
+## 7.1 Render 为什么只记账
 
-DefaultLane 的 Render 可中断。若 `beginWork` 一边 diff 一边 `appendChild`，切片中途屏幕上会少一块、或多一块刚插上的节点。双缓冲保证 WIP 是内存里的另一棵树，但宿主实例一旦挂进 `#root`，就和 current 脱节了。
-
-所以 Render 的约定是：
-
-1. 只改 Fiber：接 child 链表、写 `pendingProps`、打 `flags`。
-2. `completeWork` 可以 `createInstance`（对齐官方 DOM host config：实例先挂在 `stateNode` 上，还没进文档树）。
-3. **插入、删除、改属性和 Layout Effect** 留到同步、不可中断的 `commitRoot`；Passive Effect 由 Commit 登记，再在后续 Scheduler 任务执行。
-
-flags 是这条约定的记账本。Commit 不用再 diff 一遍，按位扫描即可。
-
-## 7.2 `Placement` / `Update` / `ChildDeletion` / `Passive`
-
-值与官方同源，方便对照：
-
-```ts
-export const NoFlags = 0;
-export const Placement = 2;
-export const Update = 4;
-export const ChildDeletion = 16;
-export const Passive = 2048;
-```
-
-| flag | 谁打 | Commit 时做什么 |
-| --- | --- | --- |
-| `Placement` | Diff：新建，或列表里相对前移 | Mutation：`insertBefore` / `appendChild` |
-| `Update` | `completeWork`：Host props / 文本变了；`useLayoutEffect` deps 变了 | Mutation：Host 改 DOM；函数组件跑 layout **destroy**。Layout：跑 layout **create** |
-| `ChildDeletion` | Diff：`deleteChild` 时打在**父**节点上 | Mutation：遍历父的 `deletions[]`，卸 effect 再 `removeChild` |
-| `Passive` | `useEffect` mount 或 deps 变了 | 后续 Scheduler 宏任务：先 destroy 再 create，并给浏览器留下绘制机会 |
-
-`Update` 一身二职：Host 的属性更新和函数组件的 `useLayoutEffect` 共用这一位。Commit 按 `fiber.tag` 分叉——Host 走 `commitWork`，`FunctionComponent` 走 hook 链表。不要写成 `if Placement else if Update`：列表节点可以同时被移动又改文本。
-
-三组 mask 决定「这一阶段要不要进这棵子树」：
-
-```ts
-MutationMask = Placement | Update | ChildDeletion
-LayoutMask   = Update
-PassiveMask  = Passive | ChildDeletion
-```
-
-`ChildDeletion` 出现在 PassiveMask 里：卸载时 Passive effect 的 destroy 也要跑（本仓库卸载简化为 Mutation 里两种 destroy 一起跑，第 12、16 章会说）。
-
-## 7.3 flags 如何沿树冒泡
-
-每个节点有两套位：
-
-- `flags`：自己的副作用。
-- `subtreeFlags`：子孙的副作用之或。
-
-`completeWork` 末尾调 `bubbleProperties`：顺着 `child → sibling`，把孩子的 `flags | subtreeFlags` 或进自己的 `subtreeFlags`，同时把 `lanes | childLanes` 冒泡成自己的 `childLanes`。
+先看最小更新：同一个 `<p>` 从 `count: 0` 变成 `count: 1`。`completeWork` 发现文本不同，但不会立即改屏幕上的 Text。它只给 HostText Fiber 加一位 `Update`：
 
 ```text
-叶子打 Update
-    │
-    ▼
-父.subtreeFlags |= Update
-    │
-    ▼
-HostRoot.subtreeFlags 带上整棵树的副作用
+HostText
+  pendingProps = "count: 1"
+  flags        = Update
 ```
 
-Commit 时先看根的 `subtreeFlags`：某一 mask 为 0，整棵子树可以跳过。没有冒泡，就要无脑遍历每一个 Fiber。
+预期结果很明确：Render 结束前，页面仍显示 `count: 0`；Commit 消费 `Update` 后，页面才显示 `count: 1`。
 
-`deletions` 不冒泡内容，只靠父节点自己的 `ChildDeletion`。真正要删的节点挂在父的数组里，因为被删的孩子已经不在 wip 的 child 链表上，光靠向下走当前树找不到它们。
+这样分阶段有两个原因。第一，DefaultLane 和 TransitionLane 的 Render 可以在 Fiber 边界让出，半成品也可能被丢弃。第二，同一轮的插入、删除、属性更新和 Effect 必须按固定顺序发生，否则用户可能看到一半新、一半旧的界面。
 
-下一章把「向下 begin、向上 complete」收成工作循环，flags 就是循环结束时树上留下的作业清单。
+本仓库的 Render 也会创建宿主对象。`completeWork` 可以调用 `createInstance` 或 `createTextInstance`，但这些节点尚未挂进已显示的文档。这里更准确的边界是：Render 不执行用户可见、需要持久保留的宿主修改；插入、移动、删除和已有节点更新留给 Commit。
+
+## 7.2 一位 flag 对应一类后续工作
+
+flag 是一个二进制位。同一个 Fiber 可以按位或同时携带多项工作，例如列表项既移动又更新属性时会同时带 `Placement | Update`。
+
+当前仓库在 `fiberFlags.ts` 定义了这些位：
+
+| flag | 在哪里产生 | 后续怎样消费 |
+| --- | --- | --- |
+| `Placement` | 子节点 Diff 发现新建或相对移动 | Mutation：插入或移动宿主节点 |
+| `Update` | Host 在 `completeWork` 发现 props / 文本变化；Hook 渲染发现 Layout Effect 要执行 | Mutation 更新 DOM 或跑 layout destroy；Layout 跑 layout create |
+| `ChildDeletion` | Diff 把待删旧 Fiber 放进父节点的 `deletions` | Mutation：清 ref、清 Effect、删除宿主节点 |
+| `Ref` | `beginWork` 发现 ref 新增或身份变化 | Layout：写入新的 ref；删除时另行清空 |
+| `Passive` | Hook 渲染发现 Passive Effect 要执行 | 后续 Scheduler 任务：先 destroy，再 create |
+| `DidCapture` | Render 捕获错误或 thenable | 边界下一次 `beginWork` 改走 fallback |
+
+`Update` 一位有两种含义，不是混乱，而是不同 tag 在同一提交阶段需要工作。Host Fiber 消费它时修改 DOM；函数组件、memo、forwardRef 消费它时处理 `useLayoutEffect`。Commit 会先看 tag，再决定执行哪条路径。
+
+阶段用 mask 把相关位合起来：
+
+```ts
+MutationMask = Placement | Update | ChildDeletion;
+LayoutMask = Update | Ref;
+PassiveMask = Passive | ChildDeletion;
+```
+
+因此不能把 `LayoutMask` 简化成 `Update`。当前实现还要在 Layout 写 ref。`DidCapture` 不属于这三组提交 mask，它服务于 Render 失败后的边界恢复。
+
+## 7.3 `subtreeFlags` 怎样剪掉空分支
+
+每个 Fiber 有两套标记：
+
+- `flags` 只表示自己要做什么；
+- `subtreeFlags` 汇总所有子孙的工作。
+
+假设只有文本叶子需要更新：
+
+```text
+HostRoot  subtreeFlags = Update
+└── App   subtreeFlags = Update
+    └── p subtreeFlags = Update
+        └── Text flags = Update
+```
+
+向上完成节点时，`bubbleProperties` 顺着直接孩子相加：
+
+```ts
+subtreeFlags |= child.subtreeFlags;
+subtreeFlags |= child.flags;
+```
+
+Commit 进入某个分支前，先拿 `subtreeFlags` 和当前阶段的 mask 做按位与。结果为 0，说明这棵子树在本阶段没有工作，可以整棵跳过。`subtreeFlags` 不包含节点自己的 `flags`，所以递归回来后还要单独检查当前节点。
+
+删除目标不能只靠向下遍历找到。旧 Fiber 已经不在新的 WIP child 链上，因此 Diff 把它放进父 Fiber 的 `deletions[]`，再给父节点打 `ChildDeletion`。Commit 先在父节点读出这份旧子树清单。
+
+下一章把 Render 的遍历收成工作循环。那一轮循环结束后，整棵 WIP 树上的 flags 就是 Commit 的执行计划。
 
 ## 面试复习
 
 ### 一句话结论
 
-flags 是 Render 阶段写在 Fiber 上的提交计划，`subtreeFlags` 是这份计划的子树索引，让 Commit 按阶段和位掩码只访问可能有副作用的分支。
-
-### 面试回答
-
-为什么 Render 不直接执行副作用？因为并发 Render 可能暂停、重启或丢弃，若此时已经插 DOM 或执行 effect，就无法安全回滚。于是数据结构上每个 Fiber 用 `flags` 记录自身工作，用 `subtreeFlags` 汇总后代工作，删除目标另存在父节点的 `deletions`；阶段上 Render 只计算，Commit 再按 Mutation、Layout、Passive 对应 mask 处理。本仓库支持 `Placement/Update/ChildDeletion/Passive`：其中 `Update` 会根据 Fiber tag 分别表示宿主更新或 layout effect 工作，多个位可同时存在，必须用按位与判断。官方 React 的 flags 和 mask 数量更多，具体数值及复用方式可能随版本变化；面试应解释机制，而不是背本仓库的四个常量值。
+`flags` 是 Fiber 自己的提交计划，`subtreeFlags` 是后代计划的索引；Render 负责写计划，Commit 按阶段 mask 消费。
 
 ### 常见追问
 
-**1. 为什么既要 `flags` 又要 `subtreeFlags`？**
+**为什么 Render 可以创建 DOM，却不能插入 DOM？**
 
-前者说明节点自己要做什么，后者让祖先快速判断某阶段是否需要进入该子树，避免 Commit 每次全树扫描。
+创建尚未挂载的实例不会改变用户正在看的文档，可以随失败的 WIP 一起丢弃；插入、删除或更新已挂载节点会产生持续可见的结果，必须等 Commit。
 
-**2. 删除为什么记在父节点？**
+**为什么删除记在父节点？**
 
-被删 Fiber 已不在新的 WIP child 链上，只向下遍历新树找不到它；父节点保留 `deletions[]` 才能在 Commit 定位旧子树。
+被删 Fiber 不在新 child 链上。父节点用 `deletions[]` 保留旧子树引用，并用 `ChildDeletion` 告诉 Commit 来处理。
 
-**3. 一个节点能同时 Placement 和 Update 吗？**
+**官方 React 也只有这些 flag 吗？**
 
-可以，例如列表项既移动又更新属性。flags 是位集合，提交逻辑不能假设副作用互斥。
-
-**4. `completeWork` 创建 DOM 是否违背 Render 无副作用？**
-
-创建未挂载实例是可丢弃的内存/宿主准备工作；真正改变可见容器的插入、删除和更新仍在 Commit。更严谨地说，Render 应避免用户可观察的持久副作用。
-
-### 容易说错
-
-- 不要把 flags 说成虚拟 DOM Diff 的结果对象；它们是挂在 Fiber 上、供分阶段提交读取的位集合。
-- 不要背诵数值后声称与所有官方版本一致；本仓库只取教学子集，官方定义会演进。
-- 不要说 `subtreeFlags` 包含当前节点自己的 flags；它只汇总子孙，当前节点仍检查 `flags`。
-- 不要说 Render 完全不创建任何 DOM 对象；本仓库在 `completeWork` 可创建尚未插入容器的实例。
+不是。本章描述当前教学仓库。官方版本的 flags、mask 和阶段细节更多，也会随版本演进。
 
 ### 源码入口
 
 - `packages/react-reconciler/src/fiberFlags.ts`：flags 与阶段 mask。
-- `packages/react-reconciler/src/childFiber.ts`：Placement、ChildDeletion 的产生。
-- `packages/react-reconciler/src/completeWork.ts`：Update 判断与 `subtreeFlags` 冒泡。
-- `packages/react-reconciler/src/commitWork.ts`：按 Mutation/Layout/Passive 消费 flags。
-- `packages/react-reconciler/src/fiber.ts`：`flags/subtreeFlags/deletions` 字段。
+- `packages/react-reconciler/src/childFiber.ts`：`Placement`、`ChildDeletion`。
+- `packages/react-reconciler/src/completeWork.ts`：Host `Update` 与 `bubbleProperties`。
+- `packages/react-reconciler/src/beginWork.ts`：`Ref`、`DidCapture` 的使用路径。
+- `packages/react-reconciler/src/commitWork.ts`：按 mask 消费 flags。
 
 ---
 
