@@ -1,194 +1,125 @@
-# 第 9 章：`beginWork` 按 tag 分发
+# 第 9 章：`beginWork` 怎样得到下一层 children
 
 [← 返回总目录](../../React设计与实现.md) · [上一章](./08-工作循环.md) · [下一章 →](./10-子节点Diff.md)
 
-> 主文件：`packages/react-reconciler/src/beginWork.ts`
-> 向下半程只做一件事：给当前 wip 接上 child 链表，把第一个 child 交回 workLoop。
+---
+
+`createElement(App)` 没有执行 `App`，那组件究竟在哪一刻运行？答案在 `beginWork`：工作循环拿到一个 Fiber 后，先根据 tag 找出它的下一层 children，再把 children 调和成 child 链。本章先走 HostRoot、函数组件、宿主节点这条主线，再补上 bailout 和其他 tag。
 
 ## 本章书签
 
-- [9.1 HostRoot：从根往下调和](#91-hostroot从根往下调和)
-- [9.2 函数组件：执行函数，得到子 Element](#92-函数组件执行函数得到子-element)
-- [9.3 HostComponent / HostText](#93-hostcomponent--hosttext)
-- [9.4 完整推演：HostRoot → App → div → HostText](#94-完整推演hostroot--app--div--hosttext)
+- [9.1 不同 tag 的 children 从哪里来](#91-不同-tag-的-children-从哪里来)
+- [9.2 什么情况下可以跳过组件](#92-什么情况下可以跳过组件)
+- [9.3 首次渲染怎样接出 child 链](#93-首次渲染怎样接出-child-链)
 - [面试复习](#面试复习)
 
 ---
 
-`beginWork` 是一张 switch。孩子从哪来，按 tag 分四条路；真正的 Diff 都进 `reconcileChildren`：
+## 9.1 不同 tag 的 children 从哪里来
+
+`beginWork(current, workInProgress, renderLanes)` 的返回值就是下一格工作：
 
 ```text
-HostRoot          → pendingProps.children（root.render 塞进来的 element）
-FunctionComponent → 先 renderWithHooks 跑组件函数，返回值当 children
-HostComponent     → pendingProps.children（div 的孩子，不执行函数）
-HostText          → 叶子，没有 child，返回 null
+HostRoot          从 pendingProps.children 取 root.render 传入的元素
+FunctionComponent 用 renderWithHooks 执行组件，返回值就是 children
+HostComponent     从 pendingProps.children 取标签内部内容
+HostText          没有孩子，返回 null
 ```
 
-`reconcileChildren` 再按**当前正在处理的 Fiber 有没有 `current`** 分叉：`current == null` → `mountChildFibers`（不跟踪副作用）；否则 → `reconcileChildFibers`。判断条件不是 `current.child == null`。这一阶段只改 Fiber、打 flags，不碰真实 DOM。
+例如：
 
-返回值约定：非 `null` 则 workLoop 继续向下；`null` 开始 `completeUnitOfWork`。
-
-## 9.1 HostRoot：从根往下调和
-
-```ts
-function updateHostRoot(current, workInProgress) {
-  const nextChildren = workInProgress.pendingProps.children;
-  reconcileChildren(current, workInProgress, nextChildren);
-  return workInProgress.child;
-}
-```
-
-`updateContainer` 把 `root.render(element)` 的 element 挂在 HostRoot 的 `pendingProps.children`。根节点自己不是 DOM 标签，也不执行函数；它只是整棵应用树的入口。
-
-这里最容易把「旧孩子为空」误说成「当前 Fiber 不存在」。
-
-第一次 `root.render` 时，`prepareFreshStack` 已经用 `createWorkInProgress(root.current, ...)` 创建了 HostRoot WIP，所以：
-
-```text
-HostRoot WIP.alternate → current HostRoot
-current HostRoot.child → null
-```
-
-因此 HostRoot 调 `reconcileChildren` 时 `current != null`，走的是
-`reconcileChildFibers(workInProgress, current.child, nextChildren)`。旧孩子虽然是 `null`，但这是**带副作用跟踪的 update 闭包**；新建出的首个应用 Fiber（例如 App）会被 `placeSingleChild` 打上 `Placement`。
-
-之后新建 App 自己执行 `beginWork` 时，它没有 `alternate`，传入的 `current == null`，它的后代才走 `mountChildFibers(false)`。
-
-## 9.2 函数组件：执行函数，得到子 Element
-
-```ts
-function updateFunctionComponent(current, workInProgress) {
-  const nextChildren = renderWithHooks(
-    current,
-    workInProgress,
-    workInProgress.type,
-    workInProgress.pendingProps,
-  );
-  reconcileChildren(current, workInProgress, nextChildren);
-  return workInProgress.child;
-}
-```
-
-三步必须按这个顺序：
-
-1. **`renderWithHooks`**：按有没有 current 链表切 mount / update dispatcher，真正执行 `App(props)`。Hook 在这一次调用里走完。
-2. **返回值当 children 去 Diff**。通常是一个 Element，也可能是数组或文本。
-3. **把第一个 child 交回 workLoop。**
-
-函数组件本身没有宿主实例。DOM 由下面的 Host* 节点在 `completeWork` 里创建。第 13、14 章会把「为什么必须在 beginWork 里跑函数、Hook 为何不能进 if」讲透。
-
-## 9.3 HostComponent / HostText
-
-宿主标签不执行函数，只 Diff `props.children`：
-
-```ts
-function updateHostComponent(current, workInProgress) {
-  reconcileChildren(
-    current,
-    workInProgress,
-    workInProgress.pendingProps.children,
-  );
-  return workInProgress.child;
-}
-```
-
-自己的 DOM 实例要等 `completeWork`：首次 `createInstance`，更新则对比 props 后打 `Update`。
-
-`HostText` 是叶子，`beginWork` 直接 `return null`。文本内容在 `pendingProps` 里（就是那个字符串），创建 / 对比发生在 `completeWork`。
-
-未知 tag（Fragment 等未实现）也返回 `null`，当作没有孩子。教学版不在这里扩展类型，避免和「按 tag 分发」这条主线抢戏。
-
-## 9.4 完整推演：HostRoot → App → div → HostText
-
-假设首次执行：
-
-```tsx
-root.render(<App />);
-
+```js
 function App() {
-  return <div>hello</div>;
+  return createElement('div', null, 'hello');
 }
 ```
 
-向下的 `beginWork` 顺序如下：
+处理 App Fiber 时，`renderWithHooks` 才真正调用 `App(props)`。输入是组件函数和 `pendingProps`，输出是 `<div>hello</div>` 对应的 Element。随后 `reconcileChildren` 把它接成 App 的 child，并把第一格 child 返回给工作循环。
+
+宿主标签不会执行函数。处理 div Fiber 时，children 直接来自 `pendingProps.children`，也就是字符串 `'hello'`。HostText 已是叶子，返回 `null`，工作循环开始向上 complete。
+
+当前仓库不只有这四种 tag。Fragment 直接调和自己的 children；ContextProvider 先 push 新 value；ForwardRef 用包装对象中的 render 函数；MemoComponent 先执行比较；Suspense 根据 `DidCapture` 选择 children 或 fallback。主线相同：每条分支最终要么返回第一格 child，要么返回 `null`。
+
+## 9.2 什么情况下可以跳过组件
+
+更新时，并不是每个函数组件都要重新执行。`canSkipUpdate` 只有在四类条件同时满足时才返回 true：
+
+1. 当前 Fiber 的 `lanes` 与本轮 `renderLanes` 没有交集；
+2. `childLanes` 也没有本轮工作；
+3. props 浅比较相同，ref 身份也没变；
+4. 上次读取的 context 没有变化。
+
+满足条件后，`bailout` 不执行组件函数。它用 `createWorkInProgress` 克隆直接 child 链，再返回 `null`，让工作循环转入 complete。这里的 bailout 不是「丢掉整个子树」；它是复用 current 的结果，并为 WIP 准备对应 child。
+
+函数组件、Fragment、Provider、ForwardRef、Memo 和 Suspense 都可能走这条路径。HostComponent 在当前实现中仍会进入 `updateHostComponent` 调和 children。错误边界或 Suspense 已带 `DidCapture` 时不能 bailout，因为这一轮必须改走 fallback。
+
+ref 的标记也发生在 begin 阶段。`markRef` 发现首次传入 ref，或 ref 身份变化，就给 Fiber 打 `Ref`；真正写入要等 Layout。
+
+## 9.3 首次渲染怎样接出 child 链
+
+第一次执行：
+
+```js
+createRoot(container).render(createElement(App, null));
+```
+
+向下顺序是：
 
 ```text
 1. HostRoot WIP
-   current = current HostRoot（存在）
-   nextChildren = <App />
-   reconcileChildFibers(current.child = null)
-   → 新建 App Fiber，App.flags |= Placement
+   current 存在，但 current.child 是 null
+   reconcileChildFibers(null, <App />)
+   → 新建 App，App.flags |= Placement
 
-2. App Fiber
-   current = App.alternate = null
-   renderWithHooks(...) → <div>hello</div>
+2. App
+   current 是 null
+   renderWithHooks() → <div>hello</div>
    mountChildFibers(null, <div />)
-   → 新建 div Fiber，不打 Placement
+   → 新建 div，不打 Placement
 
-3. div Fiber
-   current = div.alternate = null
-   nextChildren = "hello"
+3. div
+   current 是 null
    mountChildFibers(null, "hello")
-   → 新建 HostText Fiber，不打 Placement
+   → 新建 HostText，不打 Placement
 
-4. HostText Fiber
-   beginWork 直接返回 null
-   → 向下结束，工作循环转入 completeWork
+4. HostText
+   beginWork() → null
+   → 转入 complete
 ```
 
-对应的首次 WIP 树是：
+这里最容易混淆的是 `current` 和 `current.child`。`createRoot` 已经创建 current HostRoot，`prepareFreshStack` 又为它准备 WIP，因此 HostRoot 的 `current` 存在，只是旧 child 为空。它走跟踪副作用的 `reconcileChildFibers`，所以 App 得到 `Placement`。
 
-```text
-HostRoot
-  └── App [Placement]
-        └── div [NoFlags]
-              └── "hello" [NoFlags]
-```
+App 自己是新建 Fiber，没有 alternate，后代才走 `mountChildFibers(false)`。complete 阶段会先创建 Text，再创建 div 并把 Text 放进去。Commit 遇到 App 的 `Placement` 时，会跨过没有 DOM 的 App，把 div 子树插入根容器。
 
-随后向上 complete：先创建 Text，再创建 div，并把 Text append 到尚未进文档的 div。Commit 处理 App 的 `Placement` 时，`insertOrAppendPlacementNode` 会跨过没有 DOM 的 App，找到 div 并把它插入根容器。
-
-所以准确结论不是「首次整棵树都走 mount」或「首次所有节点都不打 Placement」，而是：
-
-- HostRoot 因已有 current，走 `reconcileChildFibers`，首个应用 Fiber 会打 `Placement`；
-- 这个新建应用 Fiber 的后代因没有 current，走 `mountChildFibers`，通常不各自打 `Placement`；
-- Commit 从带 `Placement` 的 Fiber 向下找到宿主节点，把 complete 阶段已组装好的宿主子树挂入容器。
-
-下一章进入 `reconcileChildren`：单节点与列表 key 如何对成一条 sibling 链表。
-
----
+下一章展开 `reconcileChildren`：新旧 children 如何按 key 和 type 对成一条新的 sibling 链。
 
 ## 面试复习
 
 ### 一句话结论
 
-`beginWork` 按 tag 决定 children 从哪来，再以当前 Fiber 是否有 `current` 决定是否跟踪 Diff 副作用；首次 HostRoot 有 current，首个应用 Fiber会打 `Placement`。
-
-### 面试回答（可口述，为什么→机制→仓库落点→官方差异）
-
-为什么要有 `beginWork`：ReactElement 是嵌套描述，渲染器需要把它逐层展开成可暂停的 Fiber 链表。机制上，HostRoot 读取 `pendingProps.children`，函数组件先执行 `renderWithHooks`，HostComponent 读取 `props.children`，HostText 到叶子返回 `null`；三类有孩子的节点统一进入 `reconcileChildren`。仓库落点是 `beginWork.ts` 与 `childFiber.ts`。本仓库只实现四种 tag，也没有官方基于 lanes、props 和 context 的 bailout，但首次 HostRoot 的边界和官方思路一致：判断 `current`，不是判断 `current.child`。
+`beginWork` 根据 tag 取得下一层 children，必要时执行函数组件，再由 `reconcileChildren` 接出 child 链；没有更深节点时返回 `null`。
 
 ### 常见追问
 
-**Q：首次渲染为什么 HostRoot 不是 mount 路径？**
-A：`createRoot` 已创建 current HostRoot，`prepareFreshStack` 又为它创建 WIP；所以 HostRoot 的 `current` 存在，只是 `current.child` 为 `null`。
+**函数组件何时执行？**
 
-**Q：函数组件在哪一刻真正执行？**
-A：它的 Fiber 进入 `beginWork` 后，在 `updateFunctionComponent` 调 `renderWithHooks` 时执行。
+它的 Fiber 进入 `beginWork` 后，在 `renderWithHooks` 中执行，不是在 `createElement` 或 `completeWork` 中执行。
 
-**Q：`beginWork` 返回 `null` 是渲染结束吗？**
-A：不是，只表示不能继续向下，工作循环转入 `completeUnitOfWork` 向上完成当前分支。
+**`beginWork` 返回 `null` 表示 Render 结束吗？**
 
-### 容易说错
+不表示。它只说明当前分支不能继续向下，工作循环接着向上 complete。
 
-- 错：`current.child == null` 就走 `mountChildFibers`。对：只看当前 Fiber 的 `current == null`。
-- 错：首次整棵树都不打 `Placement`。对：根层新建的首个应用 Fiber会被跟踪并打标。
-- 错：函数组件在 `completeWork` 执行。对：函数组件在 `beginWork` 执行，`completeWork` 只冒泡。
+**首次渲染为什么 App 有 `Placement`，div 却没有？**
+
+HostRoot 已有 current，根层跟踪副作用；新建 App 没有 current，它的后代走不跟踪副作用的 mount 路径。
 
 ### 源码入口
 
-- `packages/react-reconciler/src/beginWork.ts`
-- `packages/react-reconciler/src/childFiber.ts`
-- `packages/react-reconciler/src/workLoop.ts`：`performUnitOfWork`、`prepareFreshStack`
-- `packages/react-reconciler/src/fiber.ts`：`createWorkInProgress`
+- `packages/react-reconciler/src/beginWork.ts`：tag 分发、bailout 与 ref 标记。
+- `packages/react-reconciler/src/childFiber.ts`：`reconcileChildren`。
+- `packages/react-reconciler/src/hooks.ts`：`renderWithHooks`。
+- `packages/react-reconciler/src/workLoop.ts`：调用 `beginWork` 的工作单元。
+
+---
 
 [← 返回总目录](../../React设计与实现.md) · [上一章](./08-工作循环.md) · [下一章 →](./10-子节点Diff.md)
