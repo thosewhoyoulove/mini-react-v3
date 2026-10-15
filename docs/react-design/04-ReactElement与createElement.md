@@ -6,15 +6,6 @@
 
 第 3 章停在 `createElement(App, null)`：为什么这一行既不执行 `App`，也不创建 DOM？因为它只返回一份描述。本章用 `ListDemo` 里最小的一次调用拆开这份对象，看每一格交给谁。Fiber 要到第 6 章才出现。
 
-## 本章书签
-
-- [4.1 一次调用得到的对象](#41-一次调用得到的对象)
-- [4.2 createElement 做的四件事](#42-createelement-做的四件事)
-- [4.3 这些字段后来交给谁](#43-这些字段后来交给谁)
-- [面试复习](#面试复习)
-
----
-
 ## 4.1 一次调用得到的对象
 
 `demos/hello-dom/src/main.ts` 的列表项是这样写的：
@@ -35,9 +26,9 @@ createElement('li', { key: item }, item);
 }
 ```
 
-五格就这些。没有 `HTMLLIElement`，也没有「插到谁前面」这种步骤。本仓库处理到 `completeWork` 时才由宿主实现创建尚未挂载的 DOM；Commit 再把它插入文档。
+返回值只有这五个字段。它不是 `HTMLLIElement`，也没有记录「插到谁前面」。调和进行到 `completeWork` 时，宿主实现才创建尚未挂载的 DOM；Commit 阶段随后把它插入文档。
 
-同一页上的按钮是同一种对象，只是 `props` 里多了事件：
+同一页的按钮也会变成同样的对象，只是 `props` 多了事件：
 
 ```js
 createElement(
@@ -57,9 +48,9 @@ createElement(
 }
 ```
 
-`type` 换成函数时，对象形状不变。`createElement(App, null)` 的 `type` 就是 `App` 这个函数，`props` 是空对象。`App` 要等后面的工作循环调用，不在 `createElement` 这一行执行。
+把 `type` 换成函数，对象形状仍然不变。`createElement(App, null)` 只是把函数 `App` 放进 `type`，再给出一个空的 `props`。后面的工作循环处理这个元素时才会调用 `App`。
 
-类型定义在 `packages/shared/src/ReactTypes.ts`，`react` 和调和器共用这一份，避免两个包为了同一个声明互相依赖：
+这份结构定义在 `packages/shared/src/ReactTypes.ts`。`react` 负责创建它，调和器负责读取它，因此类型放在 `shared`，不必让两个包为了声明互相依赖：
 
 ```ts
 export interface ReactElement {
@@ -71,11 +62,11 @@ export interface ReactElement {
 }
 ```
 
-类型声明允许 `symbol | number`，但本仓库只创建 `Symbol.for('react.element')`，没有数字形式的回退路径。为什么这里选择 Symbol，下一章再说。现在先把它当成「这是一份合法描述」的标记。
+`$$typeof` 的类型允许 `symbol | number`，实际创建元素时只会写入 `Symbol.for('react.element')`，没有数字回退。它相当于元素的运行时标记，第 5 章会解释为什么使用 Symbol。
 
-## 4.2 createElement 做的四件事
+## 4.2 `createElement` 如何整理参数
 
-实现在 `packages/react/src/ReactElement.ts`。函数只做四步：拆出 `key` / `ref`，复制其余字段，收孩子，返回带标记的对象。
+回到开头的调用，`{ key: item }` 为什么没有原样成为 `props`？答案在 `packages/react/src/ReactElement.ts`：
 
 ```ts
 export function createElement(
@@ -122,12 +113,13 @@ export function createElement(
 }
 ```
 
-1. **`key` 和 `ref` 从 config 里搬出去。** `hasValidKey` 只判断 `config.key !== undefined`。所以 `key={0}` 和 `key=""` 都算显式传入，`0` 会变成字符串 `'0'`。漏写 `key` 时字段保持 `null`，和传入 `undefined` 是同一结果。`ref` 用同一条规则，原样保存，不转成字符串。
-2. **其余自有字段复制进新的 `props`。** 复制是为了不改调用方传入的那个对象。`key` 和 `ref` 在循环里被跳过，所以它们不会再从 `props` 里读到。
-3. **第三个参数及以后收成 `children`。** 一个孩子直接放进去，上面的 `'A'` 就是字符串，不再套一层数组。两个及以上才收成数组，顺序与参数顺序相同。一个孩子都没有时，`props` 上没有 `children` 这一格。
-4. **返回描述对象。** 到这一行，工作结束。调和器之后才读它。
+函数先从 `config` 取出 `key` 和 `ref`。判断条件是值不等于 `undefined`，所以 `key={0}` 和 `key=""` 都是有效 key，其中 `0` 会转成字符串 `'0'`；漏写或显式传入 `undefined` 才会保留 `null`。`ref` 使用相同的有效性判断，但不会转成字符串。
 
-用这个规则看列表容器。两个孩子会变成数组：
+接着，它把 `config` 的其余自有字段复制到一个新的 `props`。调用方传入的对象不会被修改，`key` 和 `ref` 也不会混进组件收到的参数。
+
+剩余参数决定 `children` 的形态。只有一个孩子时直接保存原值，`'A'` 仍是字符串；两个或更多孩子才组成数组；没有孩子时，`props` 上连 `children` 字段都没有。最后，函数把整理好的五个字段放进一个普通对象并返回，调和器此时还没有开始工作。
+
+把规则代回列表容器，就能直接看出两个 `li` 会组成数组：
 
 ```js
 createElement(
@@ -138,13 +130,13 @@ createElement(
 );
 ```
 
-`props.children` 是长度为 2 的数组。每个 `li` 自己的 `props.children` 仍是字符串 `'A'` 或 `'B'`。孩子的形态后面会决定调和走单节点还是列表，第 10 章再分叉。本章只要能从一次调用推出 `children` 是单值还是数组。
+外层 `ul` 的 `props.children` 长度为 2；每个 `li` 的孩子仍是单个字符串。调和器之后会据此选择单节点或列表路径，第 10 章再展开这处分支。
 
-这里讲的是本仓库的 `createElement`。官方 React 在开发构建中还可能保存 owner、源码位置或调试信息，也会做额外告警；不要把这五格当成所有 React 版本的完整内部对象。
+这里有一个容易产生误解的边界：五字段结构是本仓库实际返回的结果。官方 React 的开发构建还可能保存 owner、源码位置和调试信息，并执行额外检查。
 
 ## 4.3 这些字段后来交给谁
 
-五格的分工可以收成一张表。现在看不懂「谁用」那一列里的函数名也没关系，它们是后文的入口：
+这五个字段会沿着不同路径继续流动：
 
 | 字段 | 这一格记什么 | 后面谁读 |
 | --- | --- | --- |
@@ -154,50 +146,19 @@ createElement(
 | `ref` | 提交完成后要写入的引用 | Layout 阶段写到实例或 Fiber |
 | `props` | 属性、事件、孩子 | 函数组件的参数；宿主节点的属性和子描述 |
 
-`key` 必须离开 `props`，因为这两边的读者不同。调和器比较的是「这一项还是不是上一轮那个 `A`」，读的是 `element.key`。组件函数如果能读到 `props.key`，业务代码会把它当成自己的输入，下一次渲染又和调和器各看各的。拆开之后，组件参数里没有 `key`。
+`key` 与 `props` 分开，首先是因为读者不同。调和器用 `element.key` 判断「这一项是否还是上一轮那个 `A`」；组件函数只接收业务输入。这样，组件不会把用于同层匹配的 key 当作自己的普通属性。
 
-`ref` 离开 `props` 是同一原因：它不是画在界面上的数据。`createElement` 执行时，对应的 DOM 通常还不存在，所以这里只把引用存下来。提交阶段 DOM 已经准备好，再写 `ref.current`，或调用函数形式的 ref。`useRef()` 返回的 `{ current }` 是 Hook 里那个稳定对象；把它放进 `ref={...}` 时，元素上保存的就是这个对象。两条路径在本章先分开记，写入发生在 `packages/react-reconciler/src/commitWork.ts` 的 `commitAttachRef`。
+`ref` 也不是需要画到界面上的数据。`createElement` 执行时，对应的 DOM 通常还不存在，所以元素只保存这个引用。等 DOM 准备好后，`commitAttachRef` 才会写入对象 ref 的 `current`，或调用函数 ref。`useRef()` 返回的是 Hook 保存的稳定对象；把它传给 `ref` 后，元素记录的正是这个对象。
 
-函数组件和宿主标签在这一层长得一样。`beginWork` 看到 `type` 是函数，才会去调用它；看到 `'li'`，才会把它当成要创建的标签。调用时机在第 9 章和第 13 章。在那之前，两种元素都只是描述。
+函数组件和宿主标签在元素层没有两套结构。`beginWork` 读到函数类型才调用组件，读到 `'li'` 才按宿主标签处理。在此之前，它们都只是可供读取的描述。
 
-下一章补另一条入口。打包器把 JSX 编成 `jsx()`，参数位置和 `createElement` 不同，产出的对象相同。
+JSX 会走另一条创建入口。虽然 `jsx()` 的参数位置不同，返回的仍是这五个字段。
 
-## 面试复习
+## 本章回顾
 
-### 一句话结论
+`createElement` 把 `type`、配置和孩子整理成 ReactElement。它不调用组件，也不创建 DOM。`key` 标识同层位置，`ref` 留给提交阶段，普通属性和孩子进入 `props`；单个孩子保持原值，多个孩子才组成数组。
 
-`createElement` 把一次 UI 描述收成普通对象：`type` 是种类，`key` 是同层身份，`props` 是输入和孩子。它不创建 DOM，也不执行组件函数。
-
-### 面试回答
-
-以 `createElement('li', { key: 'A' }, 'A')` 为例。返回值里 `key` 是字符串 `'A'`，`props` 只有 `children: 'A'`。`key` 和 `ref` 被拆出去，是因为它们交给调和器和提交阶段，不交给组件当参数。一个孩子保持原值，多个孩子才收成数组，后面据此选择单节点还是列表调和。`$$typeof` 用来认出这个对象。组件函数要等工作循环按 `type` 调用；宿主节点在 `completeWork` 创建，Commit 才把它挂进文档。
-
-### 常见追问
-
-**1. 为什么不在 `createElement` 里直接创建 DOM？**
-
-这一行还不知道它是整棵树的哪一个位置，也不知道上一轮有没有可以复用的节点。描述先作为数据留下，调和完再决定创建、移动还是删除。
-
-**2. `key={0}` 和没写 `key` 一样吗？**
-
-不一样。`0 !== undefined`，会变成 `'0'`。没写，或者显式传入 `undefined`，`key` 才是 `null`。
-
-**3. 孩子为什么有时是值，有时是数组？**
-
-一个孩子不再套数组，多个孩子保持调用顺序收成数组。调和器按这个形态分支。
-
-### 容易说错
-
-- ReactElement 是描述对象。Fiber 在调和时另建；本仓库在 `completeWork` 创建离屏 DOM，在 Commit 修改已挂载的文档。
-- `key` 不会出现在组件的 `props` 里。本仓库复制属性时会跳过它。
-- `createElement(App)` 不会调用 `App`。调用发生在处理函数组件的那一步。
-
-### 源码入口
-
-- `packages/react/src/ReactElement.ts`：四步工厂。
-- `packages/shared/src/ReactTypes.ts`：五格字段的类型。
-- `packages/react-reconciler/src/fiber.ts`：`createFiberFromElement` 读取 `type` / `key` / `props` / `ref`。
-- `packages/react-reconciler/src/commitWork.ts`：`commitAttachRef` 写入 ref。
+源码可从 `packages/react/src/ReactElement.ts` 和 `packages/shared/src/ReactTypes.ts` 开始，再沿着 `createFiberFromElement`、`commitAttachRef` 查看这些字段如何被消费。
 
 ---
 

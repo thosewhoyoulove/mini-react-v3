@@ -6,18 +6,9 @@
 
 点击 reverse 后，新的 children 只是 `[C, B, A]`。框架怎样知道这三个 `<li>` 是原来的节点换了顺序，而不是三个全新节点？答案分两步：先用 key 和 type 认出同一项，再用旧下标判断谁需要移动。
 
-## 本章书签
-
-- [10.1 key 和 type 怎样认出同一个节点](#101-key-和-type-怎样认出同一个节点)
-- [10.2 数组为什么先试位置再查 Map](#102-数组为什么先试位置再查-map)
-- [10.3 lastPlacedIndex 怎样标记移动](#103-lastplacedindex-怎样标记移动)
-- [面试复习](#面试复习)
-
----
-
 ## 10.1 key 和 type 怎样认出同一个节点
 
-`reconcileChildren` 的输入和输出是：
+`reconcileChildren` 面对的是两种不同形态的数据：旧 children 已经是一条 Fiber 链表，新 children 则可能是文本、一个 Element，也可能是数组。
 
 ```text
 旧：current.child → sibling → sibling
@@ -25,9 +16,9 @@
 输出：workInProgress.child → sibling → sibling
 ```
 
-当前父 Fiber 没有 current 时，走 `mountChildFibers(false)`，只建立新链，不记录插入和删除；父 Fiber 有 current 时，走 `reconcileChildFibers(true)`，和旧 child 链比较并打 flags。判断的是 `current == null`，不是 `current.child == null`。
+父 Fiber 没有 `current`，说明整段子树正在首次挂载。此时走 `mountChildFibers`，只建立新链，不记录插入和删除；有 `current` 才走 `reconcileChildFibers`，把新 children 与 `current.child` 比较并留下 flags。这里判断的是 `current == null`，不是 `current.child == null`：一个已经挂载但暂时没有孩子的父节点，更新时仍然要记录新增孩子的 `Placement`。
 
-单元素路径沿旧兄弟链找 `key + type` 都相同的 Fiber：
+先看新 children 只有一个 Element 的情况。算法沿旧兄弟链查找，只有 `key` 和 `type` 都相同才会复用：
 
 ```text
 旧：A(key=a) → B(key=b) → C(key=c)
@@ -35,84 +26,53 @@
 结果：复用 B；A、C 记入父节点的 deletions
 ```
 
-key 回答「是不是同一项」，type 回答「能不能沿用这一种节点」。`<div key="x">` 变成 `<span key="x">` 时 key 没变，但宿主类型不同，必须新建。匹配成功后，`useFiber` 通过 `createWorkInProgress` 取出另一格 Fiber，并换上新的 props。
+`key` 回答「是不是同一项」，`type` 回答「这一项能不能沿用原来的实现」。例如 `<div key="x">` 变成 `<span key="x">`，身份标记虽然没变，宿主类型却变了，原来的 DOM 不能复用。匹配成功后，`useFiber` 通过 `createWorkInProgress` 取得对应的 WIP Fiber，换上新 props，并重新接入本轮的 sibling 链。
 
-单文本更简单：旧链表头也是 HostText 就复用，否则删除旧孩子并新建文本。单节点只有在 update 路径且确实新建时，`placeSingleChild` 才打 `Placement`。
+文本没有 key。新 children 是单段文本时，只要旧链表头也是 `HostText` 就复用；否则删除旧孩子并创建文本 Fiber。无论是单 Element 还是单文本，只有在 update 路径中确实创建了新 Fiber，`placeSingleChild` 才会打上 `Placement`。
 
 ## 10.2 数组为什么先试位置再查 Map
 
-数组 Diff 从左到右分三段执行：
+数组仍然沿用「key 定身份、type 定复用」这条规则，只是不能为每个新节点都从旧链表头重新查找。`reconcileChildrenArray` 从左到右扫描，先走成本最低的同位置匹配：
 
 ```text
-1. 同下标试探：key 对得上就继续
-2. 一边先结束：删掉多余旧节点，或创建剩余新节点
-3. 两边都还有：剩余旧节点进 Map，再按 key（无 key 时按 index）查找
+同位置 key 对得上  → 继续向后
+新列表先结束       → 删除剩余旧节点
+旧列表先结束       → 创建剩余新节点
+中途 key 对不上    → 剩余旧节点放进 Map
 ```
 
-用旧 `[A, B, C]`、新 `[A, C, B]` 走一遍：
+以旧 `[A, B, C]`、新 `[A, C, B]` 为例，A 在下标 0 直接复用；走到下标 1，旧 B 与新 C 的 key 不同，同位置匹配到此结束。剩余过程如下：
 
 ```text
-下标 0：A 对 A，复用
-下标 1：B 对 C，key 不同，停止按位置试探
-
 剩余旧节点：Map { b → B, c → C }
 新 C：命中 c，复用并从 Map 删除
 新 B：命中 b，复用并从 Map 删除
 Map 为空：没有节点需要删除
 ```
 
-先按位置走，是因为常见更新只改尾部或保持大部分顺序，不需要一开始就建 Map。失配后再把剩余旧节点放进 Map，仍能用稳定 key 找回原 Fiber 和 DOM 身份。
+这条路径既照顾了顺序大体不变、只在尾部增删的常见更新，也能在失配后借助稳定 key 找回原来的 Fiber 和 DOM。复用成功的旧节点会从 Map 删除；扫描结束后，Map 中剩下的节点就是新列表不再需要的节点，它们会进入父 Fiber 的 `deletions`。
 
-新 children 中的 `null`、`false` 或未知类型会被跳过，因此旧 Fiber 的 `index` 可能出现空洞。源码在第一轮用 `oldFiber.index > newIdx` 处理这种情况，不会把跳号误认为已经消耗了旧节点。
+新 children 中的 `null`、`false` 和未知类型会被跳过，Fiber 的 `index` 因而可能不连续。第一轮遇到 `oldFiber.index > newIdx` 时，会把这一格视为旧列表中的空洞，并保留 `oldFiber` 给后续匹配，而不是误以为这个旧节点已经被消费。
 
-没有 key 时，Map 退化为用 index。尾部追加通常仍可复用；中间插入、删除或倒序时，框架更容易把「同位置」误当成「同一项」，组件状态、焦点或输入内容可能跟着位置走。key 需要在同一层稳定且唯一，但不要求全局唯一。
+如果没有 key，Map 只能改用 index。尾部追加通常不受影响，但在中间插入、删除或倒序时，「同位置」很容易被当成「同一项」，组件状态、焦点和输入内容也可能跟着位置走。因此 key 要在同一层中稳定且唯一，不需要在整棵应用树里全局唯一。
 
 ## 10.3 `lastPlacedIndex` 怎样标记移动
 
-认出同一项后，还要决定 DOM 是否需要移动。`placeChild` 维护：
+复用只是确认「还是这个节点」，并没有回答它要不要移动。回到 `[A, B, C] → [A, C, B]`，`placeChild` 会维护一个 `lastPlacedIndex`：
 
 > `lastPlacedIndex`：已经按新顺序处理过、并可留在原位的旧节点中，最大的旧下标。
 
-继续看 `[A, B, C] → [A, C, B]`：
+新顺序先处理 A。A 的旧下标是 0，可以留在原位，`lastPlacedIndex` 变成 0。接着是 C，它的旧下标 2 不小于 0，也可以留下，于是边界推进到 2。最后处理 B，它的旧下标 1 已经落在边界后面；新顺序又要求 B 位于 C 之后，所以 B 会得到 `Placement`。
 
-| 新顺序 | 旧下标 | `lastPlacedIndex` | 结果 |
-| --- | ---: | ---: | --- |
-| A | 0 | 0 | 留在原位 |
-| C | 2 | 2 | 留在原位 |
-| B | 1 | 2 | `1 < 2`，打 `Placement` |
+这里的 `Placement` 只表示「Commit 时重新插入或移动」，Render 不会立刻操作 DOM。整段倒序 `[A, B, C] → [C, B, A]` 时，C 的旧下标 2 先成为边界，随后 B 和 A 的旧下标都小于 2，因此二者都会带上 `Placement`。稳定 key 能保住三个 DOM 的身份，却不保证只移动一次；这套从左到右的 O(n) 算法也不追求全局最少移动。
 
-B 在旧顺序里位于 C 前面，在新顺序里却位于 C 后面，因此必须移动。`Placement` 只记录「Commit 时重新插入」，Render 不操作 DOM。
+新建 Fiber 没有 `alternate`，同样会得到 `Placement`。删除的记录方式不同：被删节点本身不打标，父 Fiber 把它收入 `deletions[]`，并带上 `ChildDeletion`。到 Commit 阶段，这些记录才会真正改变宿主树。
 
-整段倒序 `[A, B, C] → [C, B, A]` 时，C 的旧下标 2 先成为锚点；B 和 A 的旧下标都小于 2，因此二者带 `Placement`。稳定 key 保证三个 DOM 可以复用，但不表示倒序只需要一次移动，也不表示算法会求全局最少操作。这是从左到右的 O(n) 启发式。
+## 本章回顾
 
-新建 Fiber 没有 alternate，也会得到 `Placement`。删除则不在被删节点上打标：父 Fiber 保存 `deletions[]` 并带 `ChildDeletion`。第 12 章会把这些标记真正落到宿主树。
+子节点 Diff 先用 key 和 type 决定能否复用，再用 `lastPlacedIndex` 判断复用节点是否需要移动。没有 key 时仍可按 index 匹配，但列表中间的增删和重排容易让状态跟错位置。算法只记录 `Placement`、`ChildDeletion` 等结果，不在 Render 阶段操作 DOM，也不保证得到全局最少移动次数。
 
-## 面试复习
-
-### 一句话结论
-
-子节点 Diff 用 key 和 type 决定复用，用 `lastPlacedIndex` 判断复用节点是否需要移动；所有结果先写在 Fiber 上。
-
-### 常见追问
-
-**没写 key 就完全不能复用吗？**
-
-不是。当前实现会按 index 匹配，但中间插入和重排容易让状态跟错节点。
-
-**key 相同为什么还要比较 type？**
-
-key 只表示同层身份。节点类型不同，宿主实例或组件语义不同，不能沿用。
-
-**数组 Diff 会算出最少移动次数吗？**
-
-不会保证。它以稳定 key 和从左到右扫描为前提，用 O(n) 启发式换取可预测成本。
-
-### 源码入口
-
-- `packages/react-reconciler/src/childFiber.ts`：`ChildReconciler`。
-- `packages/react-reconciler/src/childFiber.ts`：`reconcileChildrenArray`。
-- `packages/react-reconciler/src/childFiber.ts`：`placeChild`、`placeSingleChild`。
-- `tests/run.ts`：keyed Diff 的复用、移动和删除测试。
+继续阅读时，可以沿 `packages/react-reconciler/src/childFiber.ts` 的 `ChildReconciler → reconcileChildrenArray → placeChild` 追踪整段算法；`tests/run.ts` 里还有 keyed Diff 的复用、移动和删除案例。
 
 ---
 
