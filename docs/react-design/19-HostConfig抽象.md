@@ -4,28 +4,18 @@
 
 > 主文件：`packages/react-reconciler/src/HostConfig.ts`、`hostContext.ts`、`packages/react-dom/src/hostConfig.ts`
 
-Fiber 已经算出“这里要新增一个 `div`”，接下来却遇到一个问题：在浏览器里要调用 `document.createElement`，换到别的平台又没有 `document`。调和算法怎样描述同一次挂载，同时不依赖某个平台的 API？答案不是让 reconciler 猜平台，而是由 renderer 注入 HostConfig。
-
-## 本章书签
-
-- [19.1 HostConfig 划出的依赖边界](#191-hostconfig-划出的依赖边界)
-- [19.2 能力怎样分组以及 Container 为何独立](#192-能力怎样分组，以及-container-为何独立)
-- [19.3 一次 mount 如何落到 DOM 以及教学版边界](#193-一次-mount-如何落到-dom，以及教学版边界)
-- [面试复习](#面试复习)
-- [源码入口](#源码入口)
-
----
+Fiber 已经算出“这里要新增一个 `div`”，浏览器接下来会调用 `document.createElement`。可调和器若直接依赖 `document`，同一套 Fiber 工作流程就只能服务于 DOM。这里需要一层转换：reconciler 描述要做的宿主操作，renderer 注入 HostConfig，把这些操作翻译成平台 API。
 
 ## 19.1 HostConfig 划出的依赖边界
 
-先看一段最小伪代码。reconciler 只表达意图：
+reconciler 里的宿主操作可以缩成两句伪代码：
 
 ```ts
 const instance = hostConfig.createInstance('div', props);
 hostConfig.appendChildToContainer(container, instance);
 ```
 
-至于 `instance` 是 `HTMLElement`、测试用普通对象，还是其他平台的节点，由 HostConfig 实现决定。本仓库的依赖方向是：
+第一句要求创建一个宿主实例，第二句要求把它接入根容器。这里没有规定 `instance` 必须是 `HTMLElement`；测试 renderer 可以返回普通对象，其他平台也可以返回自己的节点。具体类型和操作都由传入的 HostConfig 决定。
 
 ```text
 react-reconciler
@@ -36,29 +26,15 @@ react-dom
   └─ hostConfig.ts 才调用 document / DOM 方法
 ```
 
-因此，`packages/react-reconciler/src` 中的 `completeWork` 与 `commitWork` 不直接引用 `document`。它们可以知道“宿主实例”“文本实例”“根容器”这些抽象角色，却不知道这些对象是否来自浏览器。
+沿着这个依赖方向，`completeWork` 和 `commitWork` 只认识“宿主实例”“文本实例”“根容器”等角色。Fiber 遍历、Diff、flags、Placement、删除顺序和 commit 时机仍由 reconciler 掌握；创建、插入、删除和更新节点时，它再调用 HostConfig。
 
-这层边界拆开了两类职责：
-
-- reconciler 负责 Fiber 遍历、Diff、flags、Placement、删除顺序和 commit 阶段。
-- HostConfig 负责把“创建、插入、删除、更新”翻译成具体平台操作。
-
-HostConfig 不是另一套 Diff 算法。比如 `commitPlacement` 先由 reconciler 找到宿主父节点和稳定兄弟，再决定 append 还是 insert；HostConfig 只执行最后那次平台调用。
-
-本仓库实际只提供 DOM renderer，但接口允许测试 renderer 用普通对象树实现同样能力。官方 React 也通过 HostConfig 支撑不同 renderer，不过其接口更大，注入主要在构建时完成，还覆盖 hydration、persistence 等模式。当前仓库是为了把依赖方向讲清而保留的最小版本。
+HostConfig 并不负责重新做一次 Diff。以 `commitPlacement` 为例，稳定兄弟节点和宿主父节点已经由 reconciler 找好，append 还是 insert 也已经确定。HostConfig 接到的任务，只是执行最后一次平台操作。本项目虽然只实现了 DOM renderer，这层接口仍把平台代码留在了 `packages/react-dom`。
 
 ## 19.2 能力怎样分组，以及 Container 为何独立
 
-`HostConfig` 可以按生命周期分成四组：
+`HostConfig` 提供的操作贯穿宿主节点的一生。`createInstance` 和 `createTextInstance` 在 complete 阶段创建节点；`appendChild`、`insertBefore` 及其 Container 版本负责组装或放置节点；`removeChild` 负责删除；`commitUpdate`、`commitTextUpdate` 则修改已经存在的实例。
 
-| 能力组 | 方法 | 本仓库中的作用 |
-| --- | --- | --- |
-| 创建 | `createInstance`、`createTextInstance` | complete 阶段创建尚未挂载的元素或文本 |
-| 插入 / 移动 | `appendChild`、`appendChildToContainer`、`insertBefore`、`insertInContainerBefore` | 组装离线子树，或在 commit 中插入、移动 |
-| 删除 | `removeChild`、`removeChildFromContainer` | commit 删除宿主节点 |
-| 更新 | `commitUpdate`、`commitTextUpdate` | commit 修改已有实例的 props 或文本 |
-
-DOM 实现非常直接：
+DOM 版本把这些抽象落实为熟悉的浏览器 API：
 
 ```ts
 createInstance(type, props) {
@@ -72,20 +48,9 @@ commitTextUpdate(textInstance, _oldText, newText) {
 }
 ```
 
-这里第一次出现了 `document`，位置在 `packages/react-dom/src/hostConfig.ts`，不在 reconciler。
+`document` 到这里才出现。创建元素时还会写入首批 props；文本更新发生在 commit 中，直接改已有文本节点的 `nodeValue`。两条路径都没有反过来介入 Fiber 的比较过程。
 
-### Container 不是普通 Instance
-
-为什么已有 `appendChild`，还需要 `appendChildToContainer`？
-
-在类型上，`HostConfig` 把二者分开：
-
-```text
-Container  根 renderer 接管的外部容器，例如传给 createRoot 的 Element
-Instance   reconciler 通过 createInstance 创建的宿主节点，例如 div
-```
-
-在 Fiber 结构上也不同：
+接口还特意区分了 `Container` 和 `Instance`。Container 是 renderer 接管的外部根容器，例如传给 `createRoot` 的元素；Instance 是 reconciler 通过 `createInstance` 创建的普通宿主节点，例如一个 `div`。二者在 Fiber 上也通向不同位置：
 
 ```text
 HostRoot.stateNode ──► FiberRoot
@@ -94,15 +59,13 @@ HostRoot.stateNode ──► FiberRoot
 HostComponent.stateNode ──► Instance
 ```
 
-所以 Placement 找到 `HostRoot` 时，不能把它的 `stateNode` 当作普通宿主父节点。`commitPlacement` 要先取 `FiberRoot.containerInfo`，再调用 `appendChildToContainer` 或 `insertInContainerBefore`；父节点是 `HostComponent` 时，才调用普通 Instance 版本。
+Placement 找到 `HostRoot` 时，要从 `FiberRoot.containerInfo` 取得容器，调用 `appendChildToContainer` 或 `insertInContainerBefore`。父节点若是 `HostComponent`，才使用接收普通 Instance 的版本。DOM 的根容器和普通元素碰巧都有 `appendChild`，但 HostConfig 的类型不能依赖这一平台特征。
 
-DOM 恰好让 Container 和 Instance 都能调用 `appendChild`，容易让人误以为这组区分多余。抽象接口不能依赖这个巧合：其他 renderer 的根容器与普通实例可能类型不同、操作也不同。
-
-还有一个容易越界的能力：**ref 不属于 HostConfig。** `beginWork` 只打 `Ref` flag；commit 的 Layout 阶段由 reconciler 执行 `commitAttachRef`，把宿主 `stateNode` 写给 ref，或调用函数 ref。HostConfig 负责产生宿主实例，却不负责 React ref 的生命周期。
+ref 走的是另一条提交路径。`beginWork` 发现 ref 变化后打上 `Ref` flag，Layout 阶段再由 reconciler 执行 `commitAttachRef`，把宿主 `stateNode` 交给函数 ref 或对象 ref。HostConfig 产出宿主实例，却不接管 React ref 的生命周期。
 
 ## 19.3 一次 mount 如何落到 DOM，以及教学版边界
 
-以第一次挂载下面的元素为例：
+把下面的元素第一次交给 root：
 
 ```tsx
 root.render(
@@ -112,7 +75,7 @@ root.render(
 );
 ```
 
-从 renderer 入口到页面出现，调用链只有两段：先在 Render/complete 阶段组装离线子树，再在 Commit 阶段接入容器。
+DOM 节点会经历“离线组装”和“接入容器”两个阶段：
 
 ```text
 ReactDOM.createRoot(container)
@@ -131,49 +94,25 @@ root.render(element)
       6. appendChildToContainer(container, section)
 ```
 
-步骤 1 到 5 会调用 DOM API 创建节点并组装关系，但整棵 `section` 仍未接入根容器。只有步骤 6 才让它进入当前已提交的宿主树。因此：
+前五步已经调用 DOM API，也已经把 `span` 和文本接到 `section` 下，但 `section` 尚未进入根容器。第六步执行后，这棵宿主子树才成为已提交 DOM 的一部分。由此也能理解为什么 `appendChild` 既可能出现在 Render，又可能出现在 Commit：关键在于 parent 是否已经挂载，而不只是方法名。
 
-```text
-createInstance ≠ 挂进根容器
-Render 中 appendChild ≠ 页面已经 commit
-```
+更新已有节点时，`completeWork` 比较新旧 props 或文本并打 `Update` flag，Mutation 阶段随后调用 `commitUpdate` 或 `commitTextUpdate`。首次 props 则在 `createInstance → applyProps` 中直接写入。本项目没有展开官方 HostConfig 中的 `prepareUpdate`、`finalizeInitialChildren` 等步骤，这些接口也不影响这里的主线。
 
-`appendChild` 能同时出现在 Render 和 Commit，是因为调用对象不同：complete 阶段把孩子装进新建的离线 Instance；Placement 遇到已挂载的普通宿主父节点时，也可用它插入或移动。是否修改可见宿主树取决于 parent 当时是否已挂载，不取决于方法名。
-
-更新路径则不重新创建实例。`completeWork` 比较新旧 props 或文本，只打 `Update` flag；Mutation 阶段再调用 `commitUpdate` 或 `commitTextUpdate`。本仓库把首次 props 直接交给 `createInstance → applyProps`，没有实现官方 HostConfig 中更细的 `prepareUpdate`、`finalizeInitialChildren` 等步骤。
-
-### 教学版为何不适合多 root 并发隔离
-
-每个 `FiberRoot` 虽然都保存自己的 `hostConfig`，但工作开始时还会把它写进模块级 `currentHostConfig`，随后 `completeWork` / `commitWork` 通过 `getHostConfig()` 读取。`workLoop.ts` 另有模块级 `currentRoot`，当沿 `return` 找不到 HostRoot 时把它作为兜底；`createContainer` 会让后创建的 root 覆盖这个指针。
+还有一项与运行上下文有关的限制。每个 `FiberRoot` 保存自己的 `hostConfig`，开始工作时却会把它写入模块级 `currentHostConfig`，`completeWork` 和 `commitWork` 再通过 `getHostConfig()` 读取。`workLoop.ts` 里的模块级 `currentRoot` 还会在沿 `return` 找不到 HostRoot 时充当兜底，后创建的 root 会覆盖这个指针。
 
 ```text
 FiberRoot.hostConfig ── setHostConfig ──► currentHostConfig
 后创建的 FiberRoot ────────────────────► currentRoot
 ```
 
-这让主流程短而易读，却形成了全局可变状态：
+这些共享指针让单 root 的调用链很短；一旦多个 root 或多个 renderer 交错、重入执行，指针便可能落在另一个上下文。本项目展示的是单 root 下的 HostConfig 注入流程，并未提供完整的多 root 并发隔离。官方 React 的宿主方法会构建进各自的 reconciler，不依靠运行时切换这样一个全局 HostConfig 指针。
 
-- `currentHostConfig` 假设同一时刻只有一个 root 的 Render/Commit 使用这条调用链；
-- `currentRoot` 的兜底只可靠地代表最近创建的 root；
-- 多 renderer、多 root 交错或可重入执行时，模块级指针可能代表错误的上下文。
+## 本章回顾
 
-所以应把当前实现描述为**教学版的单 root / 全局状态限制**，而不是通用 renderer 隔离方案。官方 React 不靠运行时切换一个全局 HostConfig 指针来支持 renderer；对应宿主方法会被构建进各自的 reconciler。
-
-## 面试复习
-
-**一句话：** reconciler 负责算出宿主操作，HostConfig 负责执行平台原语；Container 是 renderer 接管的根，不等于 `createInstance` 产生的普通 Instance。
-
-**Q：一次 mount 什么时候真正进入页面？**
-
-A：`completeWork` 先用 `createInstance` 和 `appendChild` 组装离线子树；Commit 的 Placement 再用 `appendChildToContainer` 把顶层宿主节点接入根容器。
-
-**Q：ref 为什么不在 HostConfig？**
-
-A：ref 是 React 的 commit 语义。reconciler 在 Layout 阶段负责清旧 ref、附加新 ref；HostConfig 只提供宿主实例和平台操作。
-
-**Q：本仓库的注入方式有什么限制？**
-
-A：root 虽保存 config，但运行时通过模块级 `currentHostConfig` 读取，`currentRoot` 又是最近 root 的兜底，因此它是便于教学的单 root / 全局状态模型，不具备官方实现的 renderer 与多 root 隔离能力。
+- reconciler 决定做什么以及何时做，HostConfig 把最终的宿主操作交给具体平台。
+- mount 时先在 complete 阶段组装离线宿主树，再由 Commit 的 Placement 把顶层节点接入 Container。
+- Container 与普通 Instance 在 Fiber 上的来源不同；ref 也属于 reconciler 的 commit 语义，不是 HostConfig 的属性操作。
+- 模块级 `currentHostConfig` 和 `currentRoot` 使这套实现适合讲解单 root 流程，却不足以隔离交错执行的多个 root。
 
 ### 源码入口
 
