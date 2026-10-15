@@ -4,20 +4,11 @@
 
 ---
 
-五个包看起来像把官方仓库缩小了一份。值得先看懂的不是目录名，而是 `useState` 为什么几乎没有实现。这一行决定了谁可以 import 谁。
-
-## 本章书签
-
-- [3.1 useState 为什么只有一行转发](#31-usestate-为什么只有一行转发)
-- [3.2 依赖只能朝更底层走](#32-依赖只能朝更底层走)
-- [3.3 从 createRoot 走到下一次点击](#33-从-createroot-走到下一次点击)
-- [面试复习](#面试复习)
-
----
+`useState` 从 `react` 导出，状态队列却实现在 `react-reconciler`。如果前者直接导入后者，而调和器又要使用 `react` 提供的共享对象，依赖很快就会绕成一圈。理解 mini-react 的五个包，不妨从这个看似反常的入口开始：为什么公开的 `useState` 几乎什么也不做？
 
 ## 3.1 useState 为什么只有一行转发
 
-`demos/hello-dom` 写的是 `import { useState } from 'react'`。打开 `packages/react/src/ReactHooks.ts`，函数体并没有队列，也没有 Fiber：
+`demos/hello-dom` 从 `react` 导入 `useState`。打开 `packages/react/src/ReactHooks.ts`，里面看不到更新队列，也没有 Fiber：
 
 ```ts
 function resolveDispatcher() {
@@ -37,19 +28,19 @@ export function useState<S>(
 }
 ```
 
-`ReactCurrentDispatcher.current` 平时是 `null`。组件函数外面调用 `useState`，就会走到上面这个错误。真正的 mount / update 实现在 `packages/react-reconciler/src/hooks.ts`。调和器在调用组件函数之前，把当前这套实现填进 `current`，调用结束再清掉。
+这里的 Dispatcher 是一张 Hook 函数表。真正的 `mountState` 和 `updateState` 位于 `packages/react-reconciler/src/hooks.ts`。`renderWithHooks` 执行组件前，根据本轮是首次渲染还是更新，把对应函数表写进 `ReactCurrentDispatcher.current`；组件返回或抛错后，再在 `finally` 中清空。
 
-如果在组件外执行 `useState(0)`，可预测结果不是返回 `[0, setState]`，而是抛出 `Invalid hook call`。进入 `renderWithHooks` 后，同一行调用才会被转发到本轮的 mount 或 update 实现。
+同一句 `useState(0)` 的行为取决于调用时机。组件首次渲染时，它会转到 `mountState`；更新时转到 `updateState`；组件之外没有可用 Dispatcher，会抛出 `Invalid hook call`。
 
-可以把 `current` 想成一个插座。这个比喻只描述“运行时替换实现”这一点：精确地说，`react` 包声明 `Dispatcher` 接口并保存一个可变引用，调和器在渲染函数组件期间写入对应实现。因此应用只依赖 `react` 和 `react-dom`，不必知道调和器的文件名。
+这层转发解决的是依赖方向。`react` 声明 Dispatcher 接口并保存可变引用，调和器只在组件执行期间提供实现。公共 API 不必导入调和器，应用也不需要知道 `mountState` 在哪个文件中。
 
-如果把队列逻辑直接写进 `useState`，`react` 就要 import `react-reconciler`。而调和器为了拿到 `ReactCurrentDispatcher` 已经要 import `react`。两条依赖对着走，包就循环了，Hook 也会和某一种调和过程焊死。第 2 章说调和器不该认识 `document`，这里是同一条原则的另一面：公共 API 也不该认识某一次渲染的内部实现。
+若把队列逻辑直接写进公开的 `useState`，`react` 就要反向依赖 `react-reconciler`；调和器为了读取 Dispatcher 又已经依赖 `react`，两个包会形成循环。现在的结构让 Hook API 保持稳定，首次渲染和更新的差异留在调和器内部。
 
-`createElement` 不同。它不需要等渲染开始，调用当下就能返回一个普通对象，所以实现留在 `react` 包里。第 4 章只讲这个对象。
+`createElement` 不需要这种转发。它在调用时就能根据参数创建普通对象，所以实现直接放在 `react` 包中。
 
 ## 3.2 依赖只能朝更底层走
 
-根目录是 pnpm workspace。各包的 `dependencies` 把方向固定成这样（箭头指向被 import 的一方）：
+根目录使用 pnpm workspace。各包 `package.json` 中的依赖组成下面这张图，箭头指向被导入的一方：
 
 ```text
 react-dom ──► react-reconciler ──► react ──► shared
@@ -60,7 +51,7 @@ react-dom ──► react-reconciler ──► react ──► shared
 react-dom 也直接依赖 react 和 shared
 ```
 
-对着每个 `package.json` 可以核对五条：
+五个包各自只承担一层职责：
 
 | 包 | 依赖 | 对外做什么 |
 | --- | --- | --- |
@@ -70,65 +61,39 @@ react-dom 也直接依赖 react 和 shared
 | `react-reconciler` | `react`、`scheduler`、`shared` | 把描述变成 Fiber，跑 Render / Commit。不写 `document` |
 | `react-dom` | `react`、`react-reconciler`、`shared` | `createRoot`，以及真正的 DOM 实现 |
 
-`hello-dom` 的 `package.json` 只依赖 `react` 和 `react-dom`，和上面的应用用法一致。
+最底层的 `shared` 提供各包共用的类型和符号。`scheduler` 只安排回调何时执行、何时让出主线程，不需要了解 Fiber。`react-reconciler` 使用公开的 React 约定和 Scheduler 完成 Render、Commit。最外层的 `react-dom` 同时拿得到真实容器和调和器入口，负责注入 DOM 版 `HostConfig`。
 
-读源码时用一条反例检查：调和器里出现 `document`，或 `scheduler` 里出现 Fiber，就是方向反了。调度器如果知道 Fiber，它就不再是「一段回调什么时候跑」，而会和这棵 UI 树绑在一起。
+`demos/hello-dom/package.json` 只声明 `react` 和 `react-dom`，正好对应应用看到的两个入口。其余包由运行时依赖带入。阅读源码时，如果在 `react-reconciler` 中看到 `document`，或在 `scheduler` 中看到 Fiber，通常说明职责已经穿透：前者不再能更换宿主，后者也不再是通用回调调度器。
 
-`react` 还导出了 `./jsx-runtime`。demo 手写 `createElement`，不走这条入口；打包器编译 JSX 时会走。第 5 章对照这两种入口，它们产出的对象是同一种。
+`react` 还导出 `./jsx-runtime`。demo 手写 `createElement`，不会经过这个入口；编译器转换 JSX 时才会使用它。两条路径最终都会产生相同形状的 React Element。
 
 ## 3.3 从 createRoot 走到下一次点击
 
-`demos/hello-dom/src/main.ts` 末尾：
+包图只有沿调用路径走一遍才容易记住。`demos/hello-dom/src/main.ts` 的入口是：
 
 ```ts
 createRoot(container).render(createElement(App, null));
 ```
 
-按包走一遍，每一步只看已经能在源码里指到的事实：
+先执行的是 `react` 中的 `createElement(App, null)`。它返回一份元素描述，`type` 保存 `App` 函数，此时既没有调用 `App`，也没有创建 DOM。
 
-1. `react` 的 `createElement(App, null)` 返回描述对象。`type` 是 `App` 这个函数，还没有执行它，也没有 DOM。
-2. `react-dom` 的 `createRoot` 调用 `createContainer(container, hostConfig)`。根上记下容器和宿主实现，并放一个空的 HostRoot。
-3. `root.render` 进入 `updateContainer`：把这棵描述写进 HostRoot 的 `pendingProps.children`，再请求一轮更新。首屏因此能画出来。
-4. 之后点 `+1` 或 reverse，不再经过 `root.render`。事件里调用的是 `react` 转发出去的 `setState`，由调和器里的实现入队，再请求下一轮更新。
+接着，`react-dom` 的 `createRoot` 调用 `createContainer(container, hostConfig)`。调和器创建 `FiberRoot` 和空的 HostRoot Fiber，在根上保存容器与 DOM 操作函数。返回对象的 `render` 再进入 `updateContainer`，把元素写入 HostRoot 的 `pendingProps.children`，并以 `SyncLane` 安排首次更新。
 
-第 4 步和第 3 步共用后面的 Fiber、比较和提交，入口不同。工作循环怎么向下、向上，从第 8 章开始对着 `workLoop.ts` 走。下一章先把第 1 步的返回值拆开：`type`、`key`、`props` 各自交给谁。
+首屏提交后，点击 `+1` 或 reverse 不会再次调用 `root.render`。事件回调调用公开的 `setState`，真正的 dispatch 已在 Hook 首次挂载时由调和器创建；它把 action 放进队列，再从组件 Fiber 发起调度。两条入口可以合并成一张简图：
 
-## 面试复习
+```text
+首次：createElement → createRoot → updateContainer ┐
+                                                  ├→ 调度 → Render → Commit
+更新：事件 → setState dispatch → Hook 更新队列 ────┘
+```
 
-### 一句话结论
+公开入口、状态实现和 DOM 操作分处不同包，但最终汇入同一套 Fiber 工作循环。依赖保持单向，调用路径仍然能够连成闭环。
 
-拆包是为了让公开 API、调度、调和、宿主实现单向依赖。`useState` 只转发到当前渲染插上的实现，所以 `react` 不必反过来依赖调和器。
+## 本章回顾
 
-### 面试回答
-
-应用从 `react` 引入 `useState`，但这个函数只读取 `ReactCurrentDispatcher.current`。调和器在执行组件函数前把 mount 或 update 实现填进去，执行完再清空。这样 Hook 的公开入口不用 import 调和器，调和器也不用把 DOM 写进来。`react-dom` 待在最外层，负责把容器和宿主实现交给 `createContainer`。调度器单独一个包，只回答回调何时运行。本仓库从 `createElement(App)` 到 `createRoot().render`，再从按钮里的 `setState` 回到同一套更新，都可以沿这五个包走通。
-
-### 常见追问
-
-**1. 为什么不能让 `react` 直接依赖调和器来实现 Hook？**
-
-调和器已经依赖 `react` 上的 dispatcher。再反向依赖就会成环，而且公共包会绑死某一种渲染实现。组件外面误调用时，现在的写法可以因为 `current == null` 直接报错。
-
-**2. 调度器为什么不认识 Fiber？**
-
-它只处理「这段回调何时占用主线程、是否该让出」。知道 Fiber 之后，通用的任务调度就和 UI 树的形状耦在一起了。
-
-**3. 为什么 `react-dom` 在最外层？**
-
-它同时看得到 DOM 容器和调和器入口，适合做组装。调和器只通过传进来的函数表操作宿主。
-
-### 容易说错
-
-- `react` 包导出 `useState`，不表示状态存在这个包里。状态在调和器为那次渲染准备的实现里。
-- 调度器负责何时跑回调。哪一次更新更急、要不要丢掉算到一半的树，是调和器的决定。
-- demo 只依赖 `react` 和 `react-dom`。这不表示运行时只有这两个包；`react-dom` 会再把调和器和调度器带进来。
-
-### 源码入口
-
-- `packages/react/src/ReactHooks.ts`：`resolveDispatcher` 和 `useState` 的转发。
-- `packages/react/src/ReactCurrentDispatcher.ts`：渲染期间才有值的那格 `current`。
-- `packages/react-dom/src/client.ts`：`createRoot` 如何把宿主实现交出去。
-- `packages/react-reconciler/src/workLoop.ts`：`createContainer` / `updateContainer`。
+- `react` 中的 Hook 只通过 Dispatcher 转发；mount、update 和状态队列由 `react-reconciler` 在渲染期间提供。
+- `shared`、`scheduler`、`react`、`react-reconciler`、`react-dom` 按职责单向依赖，DOM 细节停留在最外层。
+- `root.render` 与组件 `setState` 的入口不同，进入调度后会共用 Render 和 Commit 路径。
 
 ---
 

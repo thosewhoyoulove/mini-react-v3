@@ -6,32 +6,23 @@
 
 demo 手写 `createElement`，是为了让调用在源码里可见。日常代码却常写 `<li>`：浏览器不认识这对尖括号，它为什么仍能运行？因为打包器在构建时先把 JSX 换成函数调用，运行时拿到的仍是第 4 章那个对象。
 
-## 本章书签
-
-- [5.1 JSX 在打包时就被换成函数调用](#51-jsx-在打包时就被换成函数调用)
-- [5.2 $$typeof 用来挡住长得像的对象](#52-typeof-用来挡住长得像的对象)
-- [5.3 三个导出名共用一份实现](#53-三个导出名共用一份实现)
-- [面试复习](#面试复习)
-
----
-
 ## 5.1 JSX 在打包时就被换成函数调用
 
-同一颗按钮，源码里可以写成：
+先看同一颗按钮的 JSX 写法：
 
 ```jsx
 <button onClick={onReverse}>reverse</button>
 ```
 
-输入是这段 JSX，预期界面是一颗文字为 `reverse` 的按钮，点击后调用 `onReverse`。编译器有两套常见产物。
+界面会出现文字为 `reverse` 的按钮，点击时调用 `onReverse`。但 JavaScript 引擎不会直接执行上面的尖括号，Babel、TypeScript 或构建工具会先把它转换掉。常见转换方式有两种。
 
-classic 要求当前文件能看见 `React.createElement`。孩子从第三个参数开始，和第 4 章的手写调用对齐：
+classic runtime 生成 `React.createElement` 调用，因此当前文件必须能访问 `React`。孩子从第三个参数开始，与上一章的手写调用完全对齐：
 
 ```js
 React.createElement('button', { onClick: onReverse }, 'reverse');
 ```
 
-automatic 是现代 React 工具链的常见默认。具体采用哪一种转换由 Babel、TypeScript 或构建工具配置决定。automatic 模式下，编译器自己写上导入，孩子已经放进 config，文件里不必出现 `React` 这个名字：
+automatic runtime 则由编译器补上导入，并把孩子放进 config。源文件不必再为了 JSX 专门引入 `React`：
 
 ```js
 import { jsx } from 'react/jsx-runtime';
@@ -39,13 +30,13 @@ import { jsx } from 'react/jsx-runtime';
 jsx('button', { onClick: onReverse, children: 'reverse' });
 ```
 
-列表项上的 `key` 在 automatic 里常常是第三个参数，不放在 config 里：
+列表项的 `key` 通常单独出现在第三个参数：
 
 ```js
 jsx('li', { children: item }, item);
 ```
 
-本仓库的 `jsx` 在 `packages/react/src/jsx.ts`。它和 `createElement` 的差别主要是参数放在哪：
+采用哪种 runtime 取决于工具链配置。对本仓库而言，两条入口的主要差别只是参数位置：
 
 | | `createElement` | `jsx` |
 | --- | --- | --- |
@@ -53,7 +44,7 @@ jsx('li', { children: item }, item);
 | `key` | 从 `config.key` 拆出 | 先用第三个参数；没有再利用 `config.key` |
 | 谁调用 | 手写，或 classic 编译结果 | automatic 编译结果 |
 
-`maybeKey != null` 时用第三个参数，并转成字符串。否则若 `config.key !== undefined`，再补上。`ref` 仍从 config 搬出。其余字段复制进新的 `props`，`key` 和 `ref` 同样跳过。返回值还是五格：
+`packages/react/src/jsx.ts` 把第三个参数叫作 `maybeKey`。它不为 `null` 或 `undefined` 时优先采用，并转成字符串；否则再尝试读取 `config.key`。`ref` 仍从 config 中拆出，其他字段复制到新的 `props`。最终结果还是熟悉的五个字段：
 
 ```ts
 return {
@@ -65,11 +56,11 @@ return {
 };
 ```
 
-调和器因此不用知道描述来自手写还是 JSX。它只读这个对象。
+所以调和器不必追查这份描述来自手写调用还是 JSX，只需读取统一的 ReactElement。
 
 ## 5.2 `$$typeof` 用来挡住长得像的对象
 
-识别写在 `packages/react-reconciler/src/childFiber.ts`：
+现在可以回答另一个问题：为什么有 `type` 和 `props` 还不够？`packages/react-reconciler/src/childFiber.ts` 的识别条件是：
 
 ```ts
 function isReactElement(value: unknown): value is ReactElement {
@@ -87,7 +78,7 @@ function isReactElement(value: unknown): value is ReactElement {
 export const REACT_ELEMENT_TYPE = Symbol.for('react.element');
 ```
 
-用 Symbol，是为了挡住一种伪装。接口或服务端若返回这样的 JSON：
+考虑一段来自接口或服务端的 JSON：
 
 ```json
 {
@@ -96,11 +87,11 @@ export const REACT_ELEMENT_TYPE = Symbol.for('react.element');
 }
 ```
 
-`JSON.parse` 之后它像一份元素：有 `type`，有 `props`。JSON 表达不了 Symbol。解析结果没有 `$$typeof`。就算有人写成 `"$$typeof": "react.element"`，那也是字符串，和 `Symbol.for('react.element')` 不相等。`isReactElement` 会拒绝它，调和器不会按元素去创建节点。
+解析后，它在外形上很像元素，却不能携带 Symbol。即使 JSON 里出现 `"$$typeof": "react.element"`，得到的也只是字符串，不会等于 `Symbol.for('react.element')`。`isReactElement` 因而会拒绝这个对象，不让它进入元素调和路径。
 
-`Symbol.for` 按名字到当前 JavaScript agent 的全局注册表里取同一个 Symbol。`react` 包创建元素、调和器再来检查时，即使模块有多个副本，名字相同也能对上。`Symbol()` 每次都会造出一个新值，两个包各自调用时就无法相等。
+这里使用 `Symbol.for` 而非 `Symbol()` 也有实际作用。前者按名字从当前 JavaScript agent 的全局注册表取值，创建元素的包和检查元素的包能拿到同一个 Symbol；后者每次调用都会产生新值，分别创建便无法相等。
 
-这只封住「把不可信的普通对象当成元素」这一条。文本怎么转义、URL 和事件能不能执行，要靠宿主实现和业务数据各自把关。本仓库没有 `dangerouslySetInnerHTML`，上面的 JSON 不会真的变成脚本；字段仍按这个规则检查，读官方源码时对得上。
+不过，`$$typeof` 解决的只是「普通对象被误认成元素」。它不替代文本转义，也不负责检查 URL 或事件中的不可信内容。本仓库没有实现 `dangerouslySetInnerHTML`，示例中的对象不会真的生成脚本节点；保留这个例子，是为了说明品牌检查所防守的边界。
 
 ## 5.3 三个导出名共用一份实现
 
@@ -111,57 +102,26 @@ react/jsx-runtime      生产构建使用的 jsx、jsxs
 react/jsx-dev-runtime  开发构建使用的 jsxDEV
 ```
 
-编译器按孩子数量选名字。静态子节点一个或零个时调用 `jsx`，两个及以上调用 `jsxs`。开发构建调用 `jsxDEV`，官方会多带上文件名和行号。
+生产编译时，零个或一个静态孩子通常对应 `jsx`，多个静态孩子对应 `jsxs`；开发编译则使用 `jsxDEV`。在官方实现里，开发入口还会携带文件名、行号等调试信息。
 
-本仓库三个名字是同一个函数：
+本仓库把三个名字都落到同一份实现：
 
 ```ts
 export const jsxs = jsx;
 export const jsxDEV = jsx;
 ```
 
-没有静态孩子的特殊优化，也不保存源码位置。打包器无论选哪个名字，得到的元素形状都和 `createElement` 一致。
+因此这里没有针对静态孩子的额外优化，也不记录源码位置。无论编译器选择哪个导出，调和器拿到的元素形状都与 `createElement` 的结果一致。
 
-到这里，描述层可以收成两句。JSX 是构建阶段的写法，运行时只剩函数调用。一份对象要被当成元素，靠的是 `$$typeof` 这个 Symbol，不是「字段看起来像」。
+从 `<button>` 到 ReactElement 的路径至此闭合了：JSX 在构建阶段消失，运行时执行的是元素工厂；工厂返回的对象还要通过 `$$typeof` 检查，不能只靠字段外形判断。
 
-下一章离开描述。调和器要把嵌套对象改成可以在节点之间停下的链表。
+接下来，调和器会把这棵嵌套的描述树转换成便于逐节点处理的 Fiber 链表。
 
-## 面试复习
+## 本章回顾
 
-### 一句话结论
+JSX 是编译期语法。classic runtime 生成 `createElement`，automatic runtime 生成 `jsx`、`jsxs` 或 `jsxDEV`，但这些入口最终提供同一种 ReactElement。`$$typeof === Symbol.for('react.element')` 是元素的运行时品牌；它能拒绝外形相似的普通 JSON，却不是一套完整的 XSS 防护。
 
-JSX 在构建时变成 `createElement` 或 `jsx`。两条路返回同一种对象，`$$typeof` 上的 Symbol 用来拒绝长得像元素的普通数据。
-
-### 面试回答
-
-浏览器不能执行 `<button>`。classic 编译成 `createElement`，孩子在第三个参数；automatic 编译成 `jsx`，孩子已经在 config 里，`key` 常常单独作为第三个参数。调和器只检查 `$$typeof === Symbol.for('react.element')`。JSON 无法携带 Symbol，所以一段看起来有 `type` 和 `props` 的响应数据不会被当成元素。本仓库的 `jsx`、`jsxs`、`jsxDEV` 是同一个函数，区别留在编译器选择哪个名字。
-
-### 常见追问
-
-**1. automatic runtime 改变了调和过程吗？**
-
-没有。它改变的是编译产物的函数名和参数位置。进入调和器之前，对象已经是同一种 ReactElement。
-
-**2. 为什么用 `Symbol.for`，不用 `Symbol()`？**
-
-`Symbol.for` 按字符串取出全局表里的同一个值，创建元素的包和检查元素的包对得上。`Symbol()` 每次都是新值。
-
-**3. 有了 `$$typeof` 就不会有 XSS 吗？**
-
-它拒绝的是把不可信对象误认成元素。文本、链接和事件里的不可信内容，还要在各自的写入点处理。
-
-### 容易说错
-
-- JSX 在构建阶段变成函数调用。浏览器运行时看到的是调用结果，不是尖括号模板。
-- `typeof element` 对这个对象得到 `"object"`。元素种类看 `element.$$typeof` 和 `element.type`。
-- `Symbol.for` 的全局表属于当前这个 JS agent。不要把它说成跨进程、跨 Worker 也共享。
-
-### 源码入口
-
-- `packages/react/src/jsx.ts`：`jsx` / `jsxs` / `jsxDEV`。
-- `packages/react/package.json`：`jsx-runtime` 与 `jsx-dev-runtime` 的导出。
-- `packages/shared/src/ReactSymbols.ts`：`REACT_ELEMENT_TYPE`。
-- `packages/react-reconciler/src/childFiber.ts`：`isReactElement`。
+阅读源码时，可以从 `packages/react/src/jsx.ts` 和 `packages/react/package.json` 确认入口，再到 `packages/shared/src/ReactSymbols.ts`、`packages/react-reconciler/src/childFiber.ts` 跟踪品牌的创建与检查。
 
 ---
 
