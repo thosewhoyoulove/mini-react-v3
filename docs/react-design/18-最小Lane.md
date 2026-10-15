@@ -28,7 +28,7 @@ TransitionLane = 0b100; // 4
 
 `startTransition` 调用 `scope` 时，会暂时设置 `ReactCurrentBatchConfig.transition`。Hook dispatch 在更新入队时读取它：有 transition 就选择 Transition，否则选择 Default。Lane 标在更新传播经过的 Fiber 和根上，表达这次更新来自哪条路径、应当多快处理；它不是浏览器任务。
 
-Scheduler Priority 属于另一层。Lane 留在 reconciler 中，决定本轮选择哪档 React 更新；Scheduler Priority 留在任务队列中，决定已经投递的 callback 谁先执行。SyncLane 直接走 `queueMicrotask`，不会进入 Scheduler 最小堆；Default 和 Transition 才映射到 Normal 和 Low。这两套值彼此衔接，并非同一个枚举。
+第 17 章已经区分过 Lane 与 Scheduler Priority。本章只需记住它们的连接方式：SyncLane 直接走 `queueMicrotask`，Default 和 Transition 则分别映射到 Scheduler 的 Normal 和 Low。
 
 官方 React 有更多 Lane，还要处理成组的 Transition Lane、过期和饥饿等情况。这里的 `1 / 2 / 4` 只用于讲清根级选档、插队和时间切片，并不表示 React 只有三种优先级。
 
@@ -99,7 +99,7 @@ Lane 不只在根上选档，也参与 Fiber 级 bailout。`beginWork` 的 `canS
 
 不过，跳过只做到 Fiber 这一层。这里的 Hook Update 没有 `lane` 字段；`updateState` 或 `updateReducer` 一旦进入某条 Hook 队列，就会按入队顺序重放整环 action，并清空 `baseQueue`。高优 render 可能顺带消费同一队列中的低优 action，而根上残留的低优 Lane 之后仍会触发一次可能多余的渲染。
 
-官方 React 会给 Update 携带 Lane，保留被跳过的更新和基准状态，之后再 rebase。这里实现的是 Fiber 级 bailout，不包含完整的 Update 级筛选，阅读源码时要把这两层分开。
+生产版 React 会给 Update 携带 Lane，保留被跳过的更新和基准状态，之后再 rebase。这里实现的是 Fiber 级 bailout，不包含 Update 级筛选；阅读这份源码时，应把两层能力分开。
 
 ## 本章回顾
 

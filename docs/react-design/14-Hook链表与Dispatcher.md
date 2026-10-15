@@ -2,7 +2,7 @@
 
 [← 返回总目录](../../React设计与实现.md) · [上一章](./13-函数组件的执行时机.md) · [下一章 →](./15-useState与更新队列.md)
 
-同一个组件每次执行，都会重新走一遍 `useState`、`useRef` 和 `useEffect`。这些调用没有 key，局部变量名也不会留到下一轮。React 要找回每个 Hook 的数据，靠的是调用顺序、Fiber 上的单向链表，以及渲染期间临时启用的 Dispatcher。
+上一章已经看到，Hook 靠调用位置找回上一轮的数据。这一章继续追问两个更具体的问题：这些数据在 Fiber 上怎样排列？同一句 `useState(0)` 又如何在首次 render 和更新 render 中进入不同实现？
 
 > 源码入口：`packages/react-reconciler/src/hooks.ts`、`packages/react/src/ReactHooks.ts`、`packages/react/src/ReactCurrentDispatcher.ts`
 
@@ -27,21 +27,7 @@ fiber.memoizedState
       useState       useRef           useEffect
 ```
 
-下一次执行 `Profile`，第一次 Hook 调用读取旧链第一格，第二次读取第二格，依次向后。各种 Hook 共用这条链，不会先找一条 state 链，再找另一条 effect 链。调用位置就是它们跨 render 对齐时的身份。
-
-把某次调用放进条件分支，位置就可能变化：
-
-```tsx
-function Profile({ editable }) {
-  const [name] = useState('Ada'); // 第 1 格
-  if (editable) {
-    useRef(null);                 // 有时出现的第 2 格
-  }
-  useEffect(() => {}, []);        // 可能从第 3 格滑到第 2 格
-}
-```
-
-`editable` 从 `true` 变为 `false` 后，本轮第二次调用已经是 `useEffect`，旧链第二格却保存着 `useRef` 的数据。链表只知道位置，无法根据 API 名称把它送回第三格。本实现会检查“本轮 Hook 更多”的情况，但对 Hook 变少和类型变化的检查不如官方 React 开发构建完整；即使暂时没有报错，错位本身仍然存在。
+下一次执行 `Profile`，第一次 Hook 调用读取旧链第一格，第二次读取第二格，依次向后。各种 Hook 共用这条链，不会先找一条 state 链，再找另一条 effect 链。第 13 章讨论的条件调用之所以会错位，原因就在这里：链表只知道“第几格”，不会根据 Hook 名称重新搜索。
 
 链上每一格都有 `memoizedState`、`queue`、`baseQueue` 和 `next` 这些字段，不过不同 Hook 使用字段的方式不同。`useState` 把状态放在 `memoizedState`，并用 `queue` 保存更新；`useRef` 在 `memoizedState` 中保存稳定的 `{ current }` 对象；`useMemo` 和 `useCallback` 分别保存 `[计算结果, deps]` 与 `[函数, deps]`。`useEffect`、`useLayoutEffect` 也占一格，其中记录 `{ tag, create, destroy, deps }`。
 
@@ -119,8 +105,6 @@ renderWithHooks
 清理工作放在 `finally` 中，即使组件抛错也会执行。组件 render 之外没有可用的 Dispatcher，也没有正在处理的 Fiber，此时调用 Hook 就会得到非法调用错误。Dispatcher 只负责把公开 Hook API 分派到本轮实现；它不负责选择任务优先级，那是调度路径的工作。
 
 本实现通过 `current == null || current.memoizedState == null` 选择 mount。只调用 `useContext` 的组件没有普通 Hook 链，更新时仍会选 mount 表，不过两张表的 `useContext` 都指向 `readContext`，结果不受影响。官方 React 还有重渲染、开发期检查和 render phase update 等 Dispatcher，这里的两张表只是本项目涉及的路径。
-
-下一章继续沿着 `useState` 节点里的 `queue` 往下走，看看 `setState` 放进去的 action 如何在下一轮 render 中变成新状态。
 
 ## 本章回顾
 

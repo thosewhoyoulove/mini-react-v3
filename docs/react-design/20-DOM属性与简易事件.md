@@ -82,7 +82,7 @@ event.target（button）
 
 事件名称也不宜从这份实现直接类推到官方行为。这里把普通 `onXxx` 机械地转成小写原生事件名，所以 `onChange` 只会得到 `change`。官方 React DOM 会依据 React 树收集捕获与冒泡监听器，向回调提供 SyntheticEvent，并对事件名称、兼容性和更新优先级做更多处理；官方的 `onChange` 并不是原生 `change` 的简单别名。
 
-这份小型实现保留了最容易观察的两种机制：一次根监听如何派发 `onClick`，以及逐节点监听怎样在 props 更新时更换函数。下一章会回到入口，看看 `createRoot` 在何时装上根监听器，又怎样把 element 送进调和器。
+这份小型实现保留了两条最容易观察的路径：根监听器如何派发 `onClick`，以及逐节点监听怎样在 props 更新时更换函数。
 
 ## 本章回顾
 

@@ -166,8 +166,6 @@ setState(action)
   → 新状态写入 WIP Hook，commit 后显示在界面上
 ```
 
-下一章会转向同一条 Hook 链上的 effect 节点，比较 `useEffect` 与 `useLayoutEffect` 在 commit 中的执行时机。
-
 ## 本章回顾
 
 - `setState` 保存 action 并发起调度，闭包里的状态快照不会随调用立刻改变。

@@ -127,7 +127,7 @@ function Counter() {
 
 调用 `setCount` 后，Hook 先把更新放入自己的队列，再从函数组件 Fiber 向 HostRoot 标记 Lane，直接进入 `scheduleUpdateOnFiberImpl`。它与 `root.render` 的入口和 Lane 来源不同，从 `ensureRootIsScheduled` 开始则共享 begin、complete、commit 这段工作循环。
 
-根更新在这里被简化成直接改写 HostRoot 的 `pendingProps`，并固定使用 SyncLane。官方 React 会把根更新放入更新队列，再由更完整的事件优先级、Lane 和根调度逻辑处理。阅读这段教学代码时，根更新的数据结构不应与生产实现画等号。
+为了让入口足够短，根更新在这里直接改写 HostRoot 的 `pendingProps`，并固定使用 SyncLane。生产实现还会把根更新放入队列，交给更完整的事件优先级、Lane 和根调度逻辑处理；这里展示的是调用主线，不是那套数据结构的等比例缩写。
 
 多 root 也受到共享状态的影响。虽然每个 `FiberRoot` 都有自己的 `hostConfig` 和调度字段，`currentRoot`、`workInProgress`、`workInProgressRoot`、`syncRoot`、`syncScheduled` 仍是模块级变量，`setHostConfig` 保存的活动 HostConfig 也是如此。连续建立 root 会改写部分全局指针，同一轮多个根的同步任务还可能互相覆盖。
 
