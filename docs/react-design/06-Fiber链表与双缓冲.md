@@ -4,9 +4,9 @@
 
 ---
 
-第 2 章的 `mount` 要等整棵子树都 `appendChild` 完才能返回。若浏览器此时要求让出主线程，React 怎样记住「下一步从哪里继续」？ReactElement 的孩子嵌在 `props.children` 里，本身没有这个答案。本章把遍历进度放进 Fiber 链表，并为同一位置准备两格节点：一格对应当前屏幕，一格留给这一轮计算。flags 和调度代码留到后面几章。
+递归创建 DOM 时，父节点要等子树处理完才能返回。如果这段计算占用主线程太久，框架怎样退出本次回调，并在稍后接着处理？ReactElement 只用 `props.children` 描述孩子，没有保存遍历的返回路径。Fiber 补上了这些信息，并通过两份相互对应的节点，分开保存已提交结果和本轮计算。
 
-## 6.1 描述树为什么停不下来
+## 6.1 递归的进度为什么需要显式保存
 
 `packages/react-reconciler/src/fiber.ts` 文件头用了一棵很小的描述：
 
@@ -29,7 +29,7 @@ sibling  下一个兄弟
 return   父节点
 ```
 
-`return` 相当于父指针，表示当前节点完成后回到哪里。Fiber 没有 `prevSibling`；需要前一个兄弟时，只能从父节点的 `child` 重新向后查找。提交阶段寻找插入位置时，也会沿这些关系移动。
+`return` 是父指针，表示当前节点完成后回到哪里。Fiber 树仍然保留父子层级，只是把孩子之间的连接做成兄弟链，因此常被称为「Fiber 链表」。它并非把整棵树压成了一条单向链；也没有 `prevSibling` 直接指向前一个兄弟。
 
 工作循环每次处理一个 Fiber。有 `child` 就向下；没有孩子便完成当前节点，再尝试 `sibling`；兄弟也不存在时，沿 `return` 向上。这样一来，遍历进度不再依赖调用栈。让出主线程时只需保留下一个工作单元，恢复后从那个 Fiber 继续，而不是停在一段函数执行到一半的位置。
 
@@ -61,9 +61,9 @@ p → "count: 0"
 完成文本，完成 p，回到 div，再回到 HostRoot
 ```
 
-假如处理完 `"Mini React"` 后需要让出主线程，接下来要访问的 Fiber 已经明确为 `p`。保存这个指针，下一次便能直接继续。此时 `div` 尚未完成，屏幕上的 DOM 也不会因为这次暂停而改变；Fiber 链只存在于内存中。
+假如完成 `"Mini React"` 这个工作单元后需要让出主线程，循环已经完成文本和 `h1`，并把下一个工作节点设为 `p`。保存这个指针，下一次便能继续。`div` 此时尚未完成，新建的子节点也还没有插入页面。
 
-真实工作循环会在一个 Fiber 工作单元结束后检查是否应该让出，而不会暂停在任意一行源码中间。同步 Lane 也不会采用这条时间切片路径。这两点是理解「可暂停」时必须保留的边界。
+暂停时机由框架在工作单元之间检查。浏览器不会主动把组件函数停在某一行；如果一个函数连续计算 100ms，Fiber 也无法替它拆开这段执行。同步 Lane 则直接跑完工作循环，不采用时间切片路径。
 
 每个 Fiber 还用数字 `tag` 标明种类。当前例子涉及 `HostRoot`（3）、`HostComponent`（5）和 `HostText`（6）；如果 `type` 是 `App` 这样的函数，就会得到 `FunctionComponent`（0）。这些数字与官方源码对齐，便于对照阅读。
 
@@ -84,11 +84,20 @@ workInProgress.alternate === current
 
 `current` 属于已提交的树，`workInProgress` 承载本轮计算。比较结果、副作用标记和尚未插入文档的实例都先留在工作格上。提交成功后，`commitWork.ts` 执行 `root.current = finishedWork`，刚完成的树成为新的 current；原来的那格则可以在下一轮被复用。
 
-所以，可复用的位置通常在两格 Fiber 之间交换角色，而不是每次更新都永久保留一份新树。两格 Fiber 也不意味着两套 DOM：满足复用条件时，它们共享同一个 `stateNode`。只有首次出现或无法复用的位置才需要创建新的 Fiber。
+所以，可复用的位置通常在两格 Fiber 之间交换角色，不会每次更新都永久保留一份新树。两格 Fiber 也不意味着两套 DOM：满足复用条件时，它们共享同一个 `stateNode`。新位置需要创建 Fiber；已有位置第一次建立 `alternate` 时，也需要创建一格对应节点。
+
+以同一个 `<p>` 的连续更新为例，第一次提交使用 Fiber A，第一次复用时建立 Fiber B 并提交它，下一轮又可以使用 A。DOM 节点只需保留一个，A 和 B 轮流保存不同轮次的计算信息。被删除的节点则会退出这种复用关系。
 
 `createWorkInProgress` 每次只处理当前传入的这一格，并不会一次克隆整棵树：
 
 ```ts
+/**
+ * 为 current 节点准备对应的工作节点，不会一次克隆整棵树。
+ * 1. 没有 alternate 时新建节点，并建立双向对应关系。
+ * 2. 已有 alternate 时复用它，清除上一轮的提交标记。
+ * 3. 复制可延续的状态，父指针等待接入新树时填写。
+ * 4. 返回工作节点，交给后续调和过程使用。
+ */
 export function createWorkInProgress(current: Fiber, pendingProps: any): Fiber {
   let wip = current.alternate;
   if (wip == null) {
@@ -116,7 +125,7 @@ export function createWorkInProgress(current: Fiber, pendingProps: any): Fiber {
   wip.ref = current.ref;
   wip.dependencies = current.dependencies;
   wip.return = null; // 3. 还没挂回父节点，接上链表时再写
-  return wip;
+  return wip; // 4. 把准备好的工作节点交给调用方
 }
 ```
 
@@ -128,7 +137,7 @@ export function createWorkInProgress(current: Fiber, pendingProps: any): Fiber {
 
 根和子节点得到 alternate 的时机不同。首次渲染时，`h1` 和文本 Fiber 由 `createFiberFromElement`、`createFiberFromText` 直接新建，`alternate` 仍为 `null`。下一次更新尝试复用这些位置时，它们才得到另一格，此后再交换角色。
 
-未完成的结果始终留在 work-in-progress 树上。即使这一轮计算被放弃，`current` 仍指向上次成功提交的树，屏幕不会暴露半成品。至于哪些修改需要提交，由 Fiber 上的 `flags` 记录。
+未完成的结构和提交标记保存在 work-in-progress 树上。即使这一轮计算被放弃，`current` 仍指向上次成功提交的结果。但这个隔离依赖组件在渲染时保持纯粹：组件若直接改写已挂载 DOM 或其他外部对象，双缓冲无法撤销这些操作。Fiber 记录的是框架的计算进度，不会自动回滚任意 JavaScript 副作用。
 
 ## 本章回顾
 

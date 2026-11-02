@@ -1,0 +1,7 @@
+interface:
+  display_name: "Ruan Yifeng Weekly Style"
+  short_description: "Drafts in Ruan Yifeng weekly style"
+  default_prompt: "Use $ruanyifeng-weekly-style to turn these notes into a Ruan Yifeng-style Chinese weekly column."
+
+policy:
+  allow_implicit_invocation: true

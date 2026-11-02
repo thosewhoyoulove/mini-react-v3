@@ -4,7 +4,7 @@
 
 ---
 
-demo 手写 `createElement`，是为了让调用在源码里可见。日常代码却常写 `<li>`：浏览器不认识这对尖括号，它为什么仍能运行？因为打包器在构建时先把 JSX 换成函数调用，运行时拿到的仍是第 4 章那个对象。
+demo 手写 `createElement`，方便直接查看参数和返回值。日常代码更常写成 `<button>`。浏览器最终执行的仍然是 JavaScript：构建工具会先把 JSX 转成函数调用，再由这些调用创建上一章的 ReactElement。本章沿这条转换路径，说明 `jsx-runtime` 的入口，以及运行时怎样识别元素。
 
 ## 5.1 JSX 在打包时就被换成函数调用
 
@@ -58,7 +58,7 @@ return {
 
 所以调和器不必追查这份描述来自手写调用还是 JSX，只需读取统一的 ReactElement。
 
-## 5.2 `$$typeof` 用来挡住长得像的对象
+## 5.2 `$$typeof` 怎样识别元素
 
 现在可以回答另一个问题：为什么有 `type` 和 `props` 还不够？`packages/react-reconciler/src/childFiber.ts` 的识别条件是：
 
@@ -89,9 +89,11 @@ export const REACT_ELEMENT_TYPE = Symbol.for('react.element');
 
 解析后，它在外形上很像元素，却不能携带 Symbol。即使 JSON 里出现 `"$$typeof": "react.element"`，得到的也只是字符串，不会等于 `Symbol.for('react.element')`。`isReactElement` 因而会拒绝这个对象，不让它进入元素调和路径。
 
-这里使用 `Symbol.for` 而非 `Symbol()` 也有实际作用。前者按名字从当前 JavaScript agent 的全局注册表取值，创建元素的包和检查元素的包能拿到同一个 Symbol；后者每次调用都会产生新值，分别创建便无法相等。
+这里使用 `Symbol.for` 而非 `Symbol()`，是为了让不同模块按同一个名字取得同一个值。`Symbol.for` 会查询 JavaScript 的全局 Symbol 注册表；`Symbol()` 则每次创建一个新值。如果元素工厂和调和器各用一次 `Symbol()`，创建出的标记就无法相等。
 
-不过，`$$typeof` 解决的只是「普通对象被误认成元素」。它不替代文本转义，也不负责检查 URL 或事件中的不可信内容。本仓库没有实现 `dangerouslySetInnerHTML`，示例中的对象不会真的生成脚本节点；保留这个例子，是为了说明品牌检查所防守的边界。
+这个检查区分的是约定好的元素与普通数据。JSON 不能直接表示 Symbol，页面中的 JavaScript 代码却可以自己调用 `Symbol.for('react.element')`，所以该标记不提供调用方身份验证。文本转义、URL 检查和事件回调中的数据处理，也需要各自的规则。
+
+本项目没有实现 `dangerouslySetInnerHTML`。这里的 JSON 只是说明：对象即使具有 `type` 和 `props`，也不会自动获得 ReactElement 的身份。这条检查本身不能概括完整的 XSS 防护，也不能保证把一个合法标记补上就能安全渲染任意数据。
 
 ## 5.3 三个导出名共用一份实现
 
@@ -113,9 +115,7 @@ export const jsxDEV = jsx;
 
 因此这里没有针对静态孩子的额外优化，也不记录源码位置。无论编译器选择哪个导出，调和器拿到的元素形状都与 `createElement` 的结果一致。
 
-从 `<button>` 到 ReactElement 的路径至此闭合了：JSX 在构建阶段消失，运行时执行的是元素工厂；工厂返回的对象还要通过 `$$typeof` 检查，不能只靠字段外形判断。
-
-接下来，调和器会把这棵嵌套的描述树转换成便于逐节点处理的 Fiber 链表。
+从 `<button>` 到 ReactElement 的路径至此完整了：构建工具先转换 JSX，运行时调用元素工厂，调和器再检查对象上的类型标记。`createElement`、`jsx`、`jsxs` 和 `jsxDEV` 的调用形式不同，但交给调和器的是同一种描述。
 
 ## 本章回顾
 

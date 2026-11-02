@@ -4,7 +4,7 @@
 
 ---
 
-第 3 章停在 `createElement(App, null)`：为什么这一行既不执行 `App`，也不创建 DOM？因为它只返回一份描述。本章用 `ListDemo` 里最小的一次调用拆开这份对象，看每一格交给谁。Fiber 要到第 6 章才出现。
+`createElement(App, null)` 的名字里有「创建」，但它既不执行 `App`，也不创建 DOM。它创建的是描述界面的普通对象，叫作 ReactElement。用 `ListDemo` 中的一次列表项调用，就能看清这个对象保存了什么，以及后续代码为什么需要这些字段。
 
 ## 4.1 一次调用得到的对象
 
@@ -53,11 +53,21 @@ createElement(
 这份结构定义在 `packages/shared/src/ReactTypes.ts`。`react` 负责创建它，调和器负责读取它，因此类型放在 `shared`，不必让两个包为了声明互相依赖：
 
 ```ts
+/** 供元素工厂与调和器共同使用的描述结构。 */
 export interface ReactElement {
+  /** 元素的运行时类型标记。 */
   $$typeof: symbol | number;
+
+  /** 标签、组件函数或特殊包装类型。 */
   type: Type;
+
+  /** 同一组兄弟节点中的身份标记。 */
   key: Key;
+
+  /** 提交阶段处理的引用。 */
   ref: Ref;
+
+  /** 业务输入和孩子描述，不含 key 与 ref。 */
   props: Props;
 }
 ```
@@ -69,6 +79,13 @@ export interface ReactElement {
 回到开头的调用，`{ key: item }` 为什么没有原样成为 `props`？答案在 `packages/react/src/ReactElement.ts`：
 
 ```ts
+/**
+ * 把参数整理成元素描述。
+ * 1. 拆出 key 和 ref，交给框架分别处理。
+ * 2. 将其余自有字段复制到新的 props。
+ * 3. 用额外的孩子参数覆盖 props.children；没有时保留 config 的值。
+ * 4. 返回带类型标记的普通对象。
+ */
 export function createElement(
   type: Type,
   config: Props | null,
@@ -80,7 +97,7 @@ export function createElement(
 
   if (config != null) {
     if (hasValidKey(config)) {
-      key = '' + config.key; // 1
+      key = '' + config.key; // 1. key 统一转成字符串
     }
     if (hasValidRef(config)) {
       ref = config.ref; // 1
@@ -117,7 +134,9 @@ export function createElement(
 
 接着，它把 `config` 的其余自有字段复制到一个新的 `props`。调用方传入的对象不会被修改，`key` 和 `ref` 也不会混进组件收到的参数。
 
-剩余参数决定 `children` 的形态。只有一个孩子时直接保存原值，`'A'` 仍是字符串；两个或更多孩子才组成数组；没有孩子时，`props` 上连 `children` 字段都没有。最后，函数把整理好的五个字段放进一个普通对象并返回，调和器此时还没有开始工作。
+剩余参数决定是否覆盖 `config` 中已有的 `children`。只有一个孩子时直接保存原值，`'A'` 仍是字符串；两个或更多孩子才组成数组；没有额外孩子时，则保留从 `config` 复制来的 `children`。只有两处都没有提供孩子，`props` 上才没有这个字段。
+
+例如，`createElement('p', { children: 'A' })` 会保留 `'A'`；如果再传第三个参数 `'B'`，结果就是 `props.children === 'B'`。整理完参数以后，函数返回一个五字段的普通对象，调和器此时还没有开始工作。
 
 把规则代回列表容器，就能直接看出两个 `li` 会组成数组：
 
@@ -132,7 +151,7 @@ createElement(
 
 外层 `ul` 的 `props.children` 长度为 2；每个 `li` 的孩子仍是单个字符串。调和器之后会据此选择单节点或列表路径，第 10 章再展开这处分支。
 
-这里有一个容易产生误解的边界：五字段结构是本仓库实际返回的结果。官方 React 的开发构建还可能保存 owner、源码位置和调试信息，并执行额外检查。
+这是教学实现的元素形状。官方 React 的字段、开发期检查和 `ref` 处理会随版本变化；对照官方源码时，应先确认版本，不能把这里的五字段结构当作所有版本的固定约定。
 
 ## 4.3 这些字段后来交给谁
 
@@ -141,8 +160,8 @@ createElement(
 | 字段 | 这一格记什么 | 后面谁读 |
 | --- | --- | --- |
 | `$$typeof` | 这份对象是 ReactElement | 调和孩子时先校验，不靠构造函数 |
-| `type` | 字符串标签，或组件函数 | 决定建成哪一种 Fiber |
-| `key` | 同层里的哪一项 | 和 `type` 一起判断复用还是新建 |
+| `type` | 标签、组件函数或特殊包装类型 | 决定建成哪一种 Fiber |
+| `key` | 同层节点的稳定身份 | 和 `type` 一起判断复用还是新建 |
 | `ref` | 提交完成后要写入的引用 | Layout 阶段写到实例或 Fiber |
 | `props` | 属性、事件、孩子 | 函数组件的参数；宿主节点的属性和子描述 |
 
@@ -150,7 +169,7 @@ createElement(
 
 `ref` 也不是需要画到界面上的数据。`createElement` 执行时，对应的 DOM 通常还不存在，所以元素只保存这个引用。等 DOM 准备好后，`commitAttachRef` 才会写入对象 ref 的 `current`，或调用函数 ref。`useRef()` 返回的是 Hook 保存的稳定对象；把它传给 `ref` 后，元素记录的正是这个对象。
 
-函数组件和宿主标签在元素层没有两套结构。`beginWork` 读到函数类型才调用组件，读到 `'li'` 才按宿主标签处理。在此之前，它们都只是可供读取的描述。
+函数组件和宿主标签在元素层使用同一种结构。调和器根据 `type` 创建不同 tag 的 Fiber，`beginWork` 再按 tag 选择处理路径；函数组件在这时执行，`'li'` 则按宿主标签处理。`Fragment`、`memo` 等特殊类型也沿用同一种元素结构，只是有各自的类型标记。
 
 JSX 会走另一条创建入口。虽然 `jsx()` 的参数位置不同，返回的仍是这五个字段。
 

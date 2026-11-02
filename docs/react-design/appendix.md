@@ -22,7 +22,7 @@
 
 1. JSX 编译后得到 ReactElement；它是 UI 描述，不是 DOM。
 2. Reconciler 把 Element 调和成由 `child / sibling / return` 串起的 Fiber 工作单元。
-3. 更新先进入 Lane；`SyncLane` 走微任务同步完成，`DefaultLane` / `TransitionLane` 交给 Scheduler 分片。
+3. 状态更新先进入 Hook 队列，再用 Lane 标记调度优先级；`root.render` 则直接提交根描述。`SyncLane` 走微任务同步完成，`DefaultLane` / `TransitionLane` 交给 Scheduler 分片。
 4. Render 在 work-in-progress 树上执行函数组件、处理 Hook 队列并 Diff 子节点，只创建离屏实例和记录 Flags，不修改已挂载的 DOM 树。
 5. Commit 同步处理删除、插入和更新，切换 `root.current`，执行 Layout Effect；Passive Effect 延后。
 
@@ -32,7 +32,7 @@
 
 先讲 3 分钟主线，再展开：
 
-- **为什么 Fiber 能暂停**：链表节点是工作单元，`workInProgress` 保存下一步；current / work-in-progress 双缓冲隔离半成品。
+- **为什么 Fiber 能暂停**：Fiber 保存父子兄弟关系，`workInProgress` 保存下一个工作单元，循环能在单元之间退出；current / work-in-progress 双缓冲保留已提交结果。一个耗时的组件函数仍需先执行完。
 - **Diff 怎么复用和移动**：单节点看 `key + type`；数组先顺序试探，再用 Map 查剩余旧节点，`lastPlacedIndex` 判断 `Placement`。
 - **Hooks 为什么不能写在条件里**：Hook 没有名字，mount / update 都靠调用顺序对齐 Fiber 的 `memoizedState` 链表；`useState` 的 pending 是环形队列。
 
@@ -47,7 +47,7 @@
 3. 函数组件何时执行，Dispatcher 如何选择 mount / update Hook 路径。
 4. `reconcileChildren` 如何做单节点和 keyed 数组 Diff。
 5. `completeWork` 如何创建离屏宿主实例并冒泡 `subtreeFlags`。
-6. Commit 为什么按 Mutation → 切换 current → Layout 排序，Passive 为什么延后。
+6. Commit 为什么按 Mutation → 切换 current → Layout 排序，Passive 为什么通常由后续任务执行。
 7. `setState` 如何入队、标记 Lane、找到 Root，再由 Scheduler 决定后续执行。
 8. HostConfig 如何把 reconciler 与 DOM 操作隔开。
 
@@ -67,8 +67,8 @@
 | `subtreeFlags` | 子树 Flags 的汇总，让 Commit 能跳过无副作用子树。 |
 | Hook 链表 | 函数组件 Fiber 的 `memoizedState` 指向的顺序链表。 |
 | Lane | Reconciler 中表示更新优先级的 bit；本仓库可据此在 Fiber 层 bailout，但不能按 Lane 筛选单条 Hook Update。 |
-| Scheduler | 用优先级最小堆排列 callback，再通过宏任务与 5ms deadline 让出主线程的执行器。 |
-| HostConfig | Reconciler 调用的宿主能力接口；本仓库只提供 DOM 实现。 |
+| Scheduler | 用优先级最小堆排列 callback；宏任务提供执行机会，5ms 截止时间供工作循环判断是否让出。 |
+| HostConfig | Reconciler 调用的宿主能力接口；运行时提供 DOM 实现，测试使用内存实现。 |
 
 注意：ReactElement 常被简称为 Element；“Fiber 树”在结构上通过链表指针连接。Lane 决定更新优先级，Scheduler 决定 callback 何时占用主线程，两者不是同一个概念。
 
@@ -131,14 +131,14 @@ demo 入口是 `demos/hello-dom/src/main.ts`。运行 `pnpm dev` 后，页面按
 
 ## 教学实现与官方 React 的差异
 
-面试时应主动说明边界，避免把“原理相似”说成“实现等同”：
+这些差异用于校准各章的结论。对照官方源码时，还应说明具体 React 版本和场景：
 
 - **Fiber / Reconciler**：保留 child / sibling / return、alternate、Flags 等主干，但 tag、更新类型和恢复策略都远少于官方。
 - **Render / Commit**：阶段划分和核心顺序对齐；Before Mutation 在本仓库为空。删除时两种 Effect cleanup 都在 Mutation 中完成，是教学简化。
 - **Diff**：实现单节点、Fragment 与普通数组的 key / type 复用和移动；不覆盖 Portal 等官方分支。
 - **Hooks / 组件能力**：已实现 state、reducer、ref、memo/callback、context、两种 Effect，以及教学版的 Fragment、memo、forwardRef、Suspense 和 ErrorBoundary；开发期校验与异常恢复仍远少于官方。
 - **Scheduler / Lane**：Scheduler 使用优先级最小堆和固定 5ms deadline；Lane 有 `SyncLane`、`DefaultLane`、`TransitionLane`，并支持 Fiber 级 bailout。单条 Hook Update 没有 Lane，官方的过期、饥饿、跳过与 rebase 更完整。
-- **HostConfig / DOM**：接口体现宿主解耦，但本仓库只接 DOM；`onClick` 使用根容器委托，其他 `onXxx` 逐节点绑定，回调仍是原生事件而非官方 SyntheticEvent。
+- **HostConfig / DOM**：接口把调和逻辑与宿主操作分开。运行时使用 DOM 实现，测试使用内存对象树；`onClick` 采用根容器委托，其他 `onXxx` 逐节点绑定，回调收到原生事件。官方 SyntheticEvent 的事件包装和分发并未实现。
 - **DOM 创建边界**：Render 的 `completeWork` 会创建尚未挂入文档的 DOM 实例；真正插入、删除、更新已挂载 DOM 在 Commit。不要简化成“Render 完全不碰 DOM API”。
 
 ## 仓库未实现清单

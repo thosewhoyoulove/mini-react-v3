@@ -2,7 +2,7 @@
 
 [← 返回总目录](../../React设计与实现.md) · [上一章](./20-DOM属性与简易事件.md) · [下一章：附录 →](./appendix.md)
 
-`createRoot(container)` 执行后，页面还没有出现应用内容；直到 `.render(element)`，第一次更新才开始。与此同时，源码在渲染前已经有了一个名为 `current` 的 Fiber。顺着这两个现象，可以把公开 API、HostRoot、调度器和前两章的 DOM 操作连成一条路径。
+`createRoot(container)` 执行后，页面还没有出现应用内容。直到 `.render(element)`，第一次更新才开始。与此同时，源码在渲染前已经有了一个名为 `current` 的 Fiber。顺着这两个现象，可以把公开 API、HostRoot、调度器和前两章的 DOM 操作连成一条路径。
 
 > 主文件：`packages/react-dom/src/client.ts`、`packages/react-reconciler/src/workLoop.ts`
 
@@ -15,24 +15,30 @@ const root = createRoot(document.getElementById('root')!);
 root.render(<h1>Hello</h1>);
 ```
 
-第一句准备一个可以反复使用的根，第二句才把 React element 交给它。本项目的 `createRoot` 很短：
+第一句准备一个可以反复使用的根。第二句才把 React element 交给它。本项目的 `createRoot` 很短：
 
 ```ts
-// packages/react-dom/src/client.ts
+/**
+ * 给一个 DOM 容器建立可重复 render 的根。
+ *
+ * 1. 给容器挂上一次 click 委托
+ * 2. 创建 FiberRoot，并让它记住这个容器和 DOM HostConfig
+ * 3. 返回的 render 闭包固定使用这个 FiberRoot
+ */
 export function createRoot(container: Element) {
-  ensureRootClickDelegation(container);
-  const root = createContainer(container, hostConfig);
+  ensureRootClickDelegation(container); // 1
+  const root = createContainer(container, hostConfig); // 2
   return {
     render(element: ReactElement) {
-      updateContainer(element, root);
+      updateContainer(element, root); // 3
     },
   };
 }
 ```
 
-`ensureRootClickDelegation` 安装第二十章的根 `click` 监听器，`createContainer` 则创建调和器使用的根结构。这时没有安排 Render，也没有改动容器中的 DOM；返回对象里的 `render` 闭包保存了刚创建的 `FiberRoot`。
+`ensureRootClickDelegation` 安装第二十章的根 `click` 监听器。同一个容器再次调用时，`WeakSet` 会挡住重复绑定。`createContainer` 创建调和器使用的根结构。这时没有安排 Render，也没有改容器里的 DOM。返回对象里的 `render` 闭包保存了刚创建的 `FiberRoot`。
 
-`createContainer` 建立的数据关系可以缩写为：
+`createContainer` 建立的数据关系是：
 
 ```ts
 const uninitializedFiber = createHostRootFiber();
@@ -46,10 +52,11 @@ const root: FiberRoot = {
   callbackPriority: NoLane,
 };
 
-uninitializedFiber.stateNode = root;
+uninitializedFiber.stateNode = root; // HostRoot 反过来指向 FiberRoot
+currentRoot = root; // 模块级兜底指针改到这个新根
 ```
 
-这里同时出现了两个“根”。`FiberRoot` 管理整棵应用，保存真实容器、当前树和调度状态；`HostRoot Fiber` 位于 Fiber 树顶端，会像其他 Fiber 一样经过 begin、complete 和 commit。二者互相连接：
+这里同时出现了两个“根”。`FiberRoot` 管理整棵应用，保存真实容器、当前树、HostConfig 和调度状态。`HostRoot Fiber` 位于 Fiber 树顶端，会像其他 Fiber 一样经过 begin、complete 和 commit。二者互相连接：
 
 ```text
 FiberRoot.current ──► HostRoot Fiber
@@ -57,33 +64,36 @@ FiberRoot.current ──► HostRoot Fiber
         └──── stateNode ─────┘
 ```
 
-第一次调用 `.render()` 前，`current HostRoot` 已经存在，只是 `current.child === null`，还没有应用子树，`alternate` 也尚未创建。工作真正开始后，`prepareFreshStack` 才调用 `createWorkInProgress(current, ...)`，生成与它配对的 WIP HostRoot。
+第一次调用 `.render()` 前，`current HostRoot` 已经存在。它的 `child` 还是 `null`，没有应用子树，`alternate` 也还没创建。`pendingProps` 同样是 `null`。工作真正开始后，`prepareFreshStack` 才调用 `createWorkInProgress(current, ...)`，生成与它配对的 WIP HostRoot。
 
-文件里另有兼容入口 `render(element, container)`，它只是 `createRoot(container).render(element)` 的包装。每调用一次都会新建根；同一容器需要重复渲染时，应保存 `createRoot` 的返回值，再调用同一个 `root.render`。
+文件里另有兼容入口 `render(element, container)`。它的函数体就是 `createRoot(container).render(element)`。每调用一次都新建一个 `FiberRoot`，并让模块级 `currentRoot` 指向它。同一个容器上后一次调用不会更新前一个根里的 Fiber。click 监听因为按容器去重，不会再绑一次，但新树提交时仍会把自己的宿主节点 append 进这个容器。旧节点不在新树里，所以不会被这次渲染删掉。同一容器需要重复更新时，应保存 `createRoot` 的返回值，再调用同一个 `root.render`。
 
 ## 21.2 `updateContainer` 怎样启动首次渲染
 
-`.render(element)` 最终调用下面的函数：
+`.render(element)` 最终调用：
 
 ```ts
-export function updateContainer(
-  element: unknown,
-  container: FiberRoot,
-): void {
-  container.current.pendingProps = { children: element };
-  scheduleUpdateOnFiberImpl(container.current, SyncLane);
+/**
+ * 把新的 React element 安排到已有根上。
+ *
+ * 1. 写进 current HostRoot 的 pendingProps.children
+ * 2. 固定用 SyncLane 调度，不看当前是不是 transition
+ */
+export function updateContainer(element: unknown, container: FiberRoot): void {
+  container.current.pendingProps = { children: element }; // 1
+  scheduleUpdateOnFiberImpl(container.current, SyncLane); // 2
 }
 ```
 
-第一行把 element 放进 current HostRoot 的 `pendingProps.children`。之后 `beginWork` 遇到 `HostRoot`，进入 `updateHostRoot`，再把这份 children 交给 `reconcileChildren`。
+第一行把 element 放进 **current** HostRoot 的 `pendingProps.children`。之后 `prepareFreshStack` 用 `current.pendingProps ?? current.memoizedProps` 创建 WIP。首次渲染时 `memoizedProps` 还是 `null`，所以用的就是刚写上的这份 children。`beginWork` 遇到 `HostRoot`，进入 `updateHostRoot`，再把 `pendingProps.children` 交给 `reconcileChildren`。
 
-第二行在 HostRoot 上安排 `SyncLane`。这里不会根据调用场景另选 Lane，每次 `root.render(...)` 都使用固定的同步车道。同步任务先合并到微任务中；微任务开始执行后，`workLoopSync` 一次跑完 Fiber 遍历，不经过 `shouldYield` 切片。
+第二行在 HostRoot 上安排 `SyncLane`。这里不根据调用场景另选 Lane。每次 `root.render(...)` 都使用同步车道。`scheduleSyncCallback` 把同一个根上的多次 Sync 合成一个微任务。微任务开始后，`workLoopSync` 在循环里不问 `shouldYield`。若这次遍历途中又来了新的 Sync，循环仍会先走完，再按第 18 章的重启规则丢掉这次结果并重新排队。没有这样的插队时，走完就进入 commit。
 
-从公开入口到 DOM 提交，主线如下：
+从公开入口到 DOM 提交，主线是：
 
 ```text
 root.render(element)
-  → updateContainer：写 HostRoot.pendingProps.children
+  → updateContainer：写 current HostRoot.pendingProps.children
   → scheduleUpdateOnFiberImpl(HostRoot, SyncLane)
   → root.pendingLanes 合入 SyncLane
   → ensureRootIsScheduled
@@ -93,7 +103,7 @@ root.render(element)
   → commitRoot：Mutation 改 DOM，切换 current，Layout 写 ref / 跑 effect
 ```
 
-首次进入 `updateHostRoot` 时，传入的 `current` 就是 `createContainer` 提前创建的 HostRoot；空的是它的 `child`。调和器从这里生成第一棵应用 Fiber，`completeWork` 创建并组装离线 DOM，Commit 的 Placement 再把顶层宿主节点插入 `root.containerInfo`。
+首次进入 `updateHostRoot` 时，传入的 `current` 就是 `createContainer` 提前创建的 HostRoot。空的是它的 `child`。调和器从这里生成第一棵应用 Fiber。`completeWork` 创建并组装离线 DOM。Commit 的 Placement 再把顶层宿主节点插入 `root.containerInfo`。
 
 ```text
 FiberRoot
@@ -103,18 +113,23 @@ FiberRoot
           └─ 新应用 Fiber → 新宿主节点
 ```
 
-所以“首次渲染没有 current”并不准确。根 Fiber 早已就位，第一次 Render 新增的是它的 WIP 配对和下面的应用子树。
+“首次渲染没有 current”这句话对不上源码。根 Fiber 在 `createRoot` 时就已经就位。第一次 Render 新增的是它的 WIP 配对，以及这棵 WIP 下面的应用子树。Commit 之后，原来的 WIP 成为新的 `root.current`。
 
 ## 21.3 后续更新与多 root 限制
 
-同一个 root 后续仍从 `updateContainer` 进入：
+同一个 root 后续仍从 `updateContainer` 进入。下面把第二次调用放到定时器任务中，让第一次 Sync 更新先在微任务里提交：
 
 ```tsx
 root.render(<h1>Hello</h1>);
-root.render(<h1>Welcome</h1>);
+
+setTimeout(() => {
+  root.render(<h1>Welcome</h1>); // 首次提交完成后，再提交新描述
+}, 0);
 ```
 
-第二次调用会改写那一刻的 current HostRoot 的 `pendingProps.children`，再安排一次 SyncLane。此时 `current.child` 已经指向上次提交的应用树，调和器可以复用 Fiber 和 DOM，只为实际变化标记 Placement、Update 或 Deletion。
+第二次调用会改写那一刻的 current HostRoot 的 `pendingProps.children`，再安排一次 SyncLane。此时 `current.child` 已经指向上次提交的应用树。调和器可以复用 Fiber 和 DOM，只为实际变化标记 Placement、Update 或 Deletion。`performUnitOfWork` 在处理节点时会把 `pendingProps` 抄到 `memoizedProps`。下一次若没有新的 `root.render`，`prepareFreshStack` 仍能从 HostRoot 上拿到上一份 children。
+
+如果两次 `root.render` 紧挨着写在同一次同步调用里，结果不同：第二次会在首次微任务执行前覆盖 HostRoot 的 `pendingProps`，这一轮直接提交 `Welcome`。此时还没有一棵已提交的 `Hello` 子树可供复用。两种写法都能更新根，但对应的是不同的执行过程。
 
 组件里的 `setState` 不会绕回 `updateContainer`：
 
@@ -125,27 +140,39 @@ function Counter() {
 }
 ```
 
-调用 `setCount` 后，Hook 先把更新放入自己的队列，再从函数组件 Fiber 向 HostRoot 标记 Lane，直接进入 `scheduleUpdateOnFiberImpl`。它与 `root.render` 的入口和 Lane 来源不同，从 `ensureRootIsScheduled` 开始则共享 begin、complete、commit 这段工作循环。
+`setCount` 先把更新放进 Hook 队列，再从函数组件 Fiber 向 HostRoot 标记 Lane，直接进入 `scheduleUpdateOnFiberImpl`。这次 Lane 来自 `requestUpdateLane`，普通点击是 `DefaultLane`，不是 `SyncLane`。HostRoot 的 `pendingProps.children` 保持 `root.render` 留下的那份。从 `ensureRootIsScheduled` 开始，它和根更新共用 begin、complete、commit。
 
-为了让入口足够短，根更新在这里直接改写 HostRoot 的 `pendingProps`，并固定使用 SyncLane。生产实现还会把根更新放入队列，交给更完整的事件优先级、Lane 和根调度逻辑处理；这里展示的是调用主线，不是那套数据结构的等比例缩写。
+根更新在这里直接改 `pendingProps`，并固定使用 SyncLane。生产实现还会把根更新放进队列，交给更完整的事件优先级和 Lane 逻辑。这里展示的是调用主线，不是那套队列的等比例缩写。
 
-多 root 也受到共享状态的影响。虽然每个 `FiberRoot` 都有自己的 `hostConfig` 和调度字段，`currentRoot`、`workInProgress`、`workInProgressRoot`、`syncRoot`、`syncScheduled` 仍是模块级变量，`setHostConfig` 保存的活动 HostConfig 也是如此。连续建立 root 会改写部分全局指针，同一轮多个根的同步任务还可能互相覆盖。
+多 root 受共享状态影响。每个 `FiberRoot` 都有自己的 `hostConfig`、`pendingLanes`、`callbackNode` 和 `current`。下面这些却是模块级变量：`currentRoot`、`currentHostConfig`、`workInProgress`、`workInProgressRoot`、`workInProgressRootRenderLanes`、`rootNeedsRestart`、`syncRoot`、`syncScheduled`。Passive 用的 `pendingPassiveEffects` 和 `rootDoesHavePassiveEffects` 也是整份 reconciler 共用的，不挂在某一个 `FiberRoot` 上。
 
-这些字段足以串起单 root 的完整生命周期，却没有形成官方 React 那样的多 root 并发隔离。这里保留的是数据结构和调用主线，不是生产调度器的等价实现。
+连续 `createRoot` 会改写 `currentRoot` 和 `currentHostConfig`。同一轮里对两个根调用 `render`，还会共享一个微任务槽：
+
+```tsx
+const a = createRoot(document.getElementById('a')!);
+const b = createRoot(document.getElementById('b')!);
+a.render(<h1>A</h1>);
+b.render(<h1>B</h1>);
+```
+
+两次 `scheduleSyncCallback` 发生在同一次同步调用里。后一次把 `syncRoot` 改成 `b` 就返回了。微任务只执行 `performSyncWorkOnRoot(b)`。`a` 的 `pendingLanes` 里仍然有 `SyncLane`，但 `callbackNode` 是空的，这次微任务结束之后也没有人再为 `a` 调用 `ensureRootIsScheduled`。结果是这一轮只有 B 被画出来。A 要等自己身上再来一次更新，才会重新获得调度机会。
+
+这些字段足够串起单 root 的生命周期：创建空的 current HostRoot，用 SyncLane 提交第一棵树，再用同一个根接受后面的 `render` 和 `setState`。它们没有形成官方 React 那样的多 root 隔离。这里保留的是数据结构和单根调用主线。
 
 ## 本章回顾
 
-- `createRoot` 安装根 click 委托，并建立相互引用的 `FiberRoot` 与空 `current HostRoot`；真正的更新从 `.render()` 开始。
-- `updateContainer` 写入根的 `pendingProps.children`，以固定的 SyncLane 调度首次及后续根更新。
-- 首次渲染已有 current HostRoot，第一次工作创建的是 WIP alternate 和应用子树。
-- `setState` 从组件更新队列进入调度；模块级工作指针又使这套调度只适合解释单 root 主线。
+- `createRoot` 安装根 click 委托，并建立相互引用的 `FiberRoot` 与空 `current HostRoot`。真正的更新从 `.render()` 开始。
+- `render(element, container)` 每次新建根。重复调用不会更新上一个 Fiber 树，也可能往同一个容器里再 append 一套节点。
+- `updateContainer` 写入 current 根的 `pendingProps.children`，并用固定的 SyncLane 调度首次及后续根更新。
+- 首次渲染已经有 current HostRoot。第一次工作创建的是 WIP alternate 和应用子树。
+- `setState` 从组件更新队列进入调度，不改写这份根 children。模块级工作指针和单个 `syncRoot` 使这套调度只适合解释单 root 主线。
 
 ### 源码入口
 
 - `packages/react-dom/src/client.ts`：`createRoot`、`render`
 - `packages/react-dom/src/hostConfig.ts`：`ensureRootClickDelegation`
 - `packages/react-reconciler/src/workLoop.ts`：`createContainer`、`updateContainer`
-- `packages/react-reconciler/src/workLoop.ts`：`prepareFreshStack`、`ensureRootIsScheduled`
+- `packages/react-reconciler/src/workLoop.ts`：`prepareFreshStack`、`ensureRootIsScheduled`、`scheduleSyncCallback`
 - `packages/react-reconciler/src/beginWork.ts`：`updateHostRoot`
 - `packages/react-reconciler/src/commitWork.ts`：`commitRoot`、`commitPlacement`
 

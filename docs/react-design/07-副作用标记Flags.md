@@ -4,7 +4,7 @@
 
 ---
 
-同一个 `<p>` 从 `count: 0` 更新为 `count: 1` 时，屏幕不会在 Render 途中突然变化。`completeWork` 已经发现文本不同，却只在 Fiber 上留下一个标记。真实文本要到 Commit 才会改写。Render 与 Commit 之间传递的这份待办记录，就是 flags。
+`<p>` 里的文本从 `count: 0` 更新为 `count: 1`，需要经过两次不同的动作：Render 发现差异，Commit 修改页面。两者之间靠什么传递结果？`completeWork` 会在文本 Fiber 上留下 `Update` 标记，提交时再按这个标记执行。Fiber 上的 flags 就是这样一组待执行的操作记录。
 
 ## 7.1 文本已经变了，DOM 为什么还没变
 
@@ -24,14 +24,16 @@ Render 并非完全不接触宿主对象。首次挂载时，`completeWork` 会�
 
 ## 7.2 一组二进制位如何变成提交清单
 
-每种 flag 占一个二进制位。按位或把多项工作放进同一个数字，于是一个列表项可以同时携带 `Placement | Update`：它既要移动，属性也要更新。Commit 用按位与逐项检查，两项工作都会执行。
+每种 flag 占一个二进制位。例如 `Placement` 为 2，`Update` 为 4，二者按位或得到 6。一个列表项携带 `Placement | Update`，就表示既要移动，属性也要更新。Commit 分别检查 `flags & Placement` 和 `flags & Update`，两个结果都不为 0，两项工作都会执行。
+
+这里的「副作用」指框架计算之外要执行的动作，既包括 DOM 修改，也包括调用 Effect 和写入 ref。它的含义比 `useEffect` 这个 Hook 更广。
 
 | flag | 在哪里产生 | 后续怎样消费 |
 | --- | --- | --- |
 | `Placement` | 子节点 Diff 发现新建或相对移动 | Mutation：插入或移动宿主节点 |
 | `Update` | Host 在 `completeWork` 发现 props / 文本变化；Hook 渲染发现 Layout Effect 要执行 | Mutation 更新 DOM 或跑 layout destroy；Layout 跑 layout create |
 | `ChildDeletion` | Diff 把待删旧 Fiber 放进父节点的 `deletions` | Mutation：清 ref、清 Effect、删除宿主节点 |
-| `Ref` | `beginWork` 发现 ref 新增或身份变化 | Layout：写入新的 ref；删除时另行清空 |
+| `Ref` | `beginWork` 发现 ref 新增、移除或身份变化 | Layout：清理旧 ref、写入新 ref；删除时另行清空 |
 | `Passive` | Hook 渲染发现 Passive Effect 要执行 | 后续 Scheduler 任务：先 destroy，再 create |
 | `DidCapture` | Render 捕获错误或 thenable | 边界下一次 `beginWork` 改走 fallback |
 
@@ -47,7 +49,7 @@ PassiveMask = Passive | ChildDeletion;
 
 Mutation 只进入可能插入、更新或删除的分支，Layout 还要处理 ref。`PassiveMask` 虽然包含 `ChildDeletion`，但这份教学实现会在 Mutation 的删除路径中同步清理被删子树的 Effect；后续 Passive 遍历处理的是仍在 finished tree 上的 Effect。`DidCapture` 不在这三组 mask 中，它留在 Render 流程里，引导错误边界或 Suspense 改走 fallback。
 
-## 7.3 `subtreeFlags` 如何剪掉无事可做的分支
+## 7.3 `subtreeFlags` 怎样跳过没有任务的子树
 
 每个 Fiber 有两套标记：
 

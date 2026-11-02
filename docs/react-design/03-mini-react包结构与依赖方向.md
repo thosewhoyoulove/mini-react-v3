@@ -4,7 +4,7 @@
 
 ---
 
-`useState` 从 `react` 导出，状态队列却实现在 `react-reconciler`。如果前者直接导入后者，而调和器又要使用 `react` 提供的共享对象，依赖很快就会绕成一圈。理解 mini-react 的五个包，不妨从这个看似反常的入口开始：为什么公开的 `useState` 几乎什么也不做？
+`useState` 从 `react` 导出，状态队列却实现在 `react-reconciler`。两个包怎样配合，又怎样避免互相导入？公开的 `useState` 提供了一个很好的观察入口：它几乎只做一次转发。沿这次调用往下找，五个包的分工就清楚了。
 
 ## 3.1 useState 为什么只有一行转发
 
@@ -40,18 +40,9 @@ export function useState<S>(
 
 ## 3.2 依赖只能朝更底层走
 
-根目录使用 pnpm workspace。各包 `package.json` 中的依赖组成下面这张图，箭头指向被导入的一方：
+根目录使用 pnpm workspace 管理五个包。各包 `package.json` 声明的依赖从公共类型逐层向外展开：`react` 和 `scheduler` 都只依赖 `shared`，两者彼此独立；`react-reconciler` 依赖这三个包；`react-dom` 再依赖 `react-reconciler`、`react` 和 `shared`。
 
-```text
-react-dom ──► react-reconciler ──► react ──► shared
-                 │                    ▲
-                 ├──► scheduler ──────┘
-                 └──────────────────► shared
-
-react-dom 也直接依赖 react 和 shared
-```
-
-五个包各自只承担一层职责：
+这份依赖关系决定了代码可以放在哪里：
 
 | 包 | 依赖 | 对外做什么 |
 | --- | --- | --- |
@@ -75,17 +66,13 @@ react-dom 也直接依赖 react 和 shared
 createRoot(container).render(createElement(App, null));
 ```
 
-先执行的是 `react` 中的 `createElement(App, null)`。它返回一份元素描述，`type` 保存 `App` 函数，此时既没有调用 `App`，也没有创建 DOM。
+这行表达式先调用 `react-dom` 的 `createRoot(container)`，得到带有 `render` 方法的根对象。`createRoot` 内部把 DOM 版 `HostConfig` 传给 `createContainer`，由调和器创建 `FiberRoot` 和空的 HostRoot Fiber。前者保存应用容器等信息，后者是 Fiber 树的根。
 
-接着，`react-dom` 的 `createRoot` 调用 `createContainer(container, hostConfig)`。调和器创建 `FiberRoot` 和空的 HostRoot Fiber，在根上保存容器与 DOM 操作函数。返回对象的 `render` 再进入 `updateContainer`，把元素写入 HostRoot 的 `pendingProps.children`，并以 `SyncLane` 安排首次更新。
+随后，JavaScript 求出 `render` 的参数：`react` 中的 `createElement(App, null)` 返回元素描述，把 `App` 函数保存在 `type` 中，此时既没有调用 `App`，也没有创建 DOM。参数准备好后，`render` 才进入 `updateContainer`，把描述写入 HostRoot 的 `pendingProps.children`，并以 `SyncLane` 安排更新。
 
-首屏提交后，点击 `+1` 或 reverse 不会再次调用 `root.render`。事件回调调用公开的 `setState`，真正的 dispatch 已在 Hook 首次挂载时由调和器创建；它把 action 放进队列，再从组件 Fiber 发起调度。两条入口可以合并成一张简图：
+首屏提交后，点击 `+1` 或 reverse 不会再次调用 `root.render`。事件回调使用的是 `useState` 返回的状态 setter，例如 `setCount` 或 `setItems`；它们并非另一个从 `react` 导出的函数，而是调和器在 Hook 首次挂载时创建的 dispatch。dispatch 把 action 放进队列，再从组件 Fiber 发起调度。
 
-```text
-首次：createElement → createRoot → updateContainer ┐
-                                                  ├→ 调度 → Render → Commit
-更新：事件 → setState dispatch → Hook 更新队列 ────┘
-```
+因此，应用有两个更新入口：`root.render` 提交新的根描述，状态 setter 提交一条状态更新。它们最终都会安排 Fiber 工作，再经过 Render 和 Commit。
 
 公开入口、状态实现和 DOM 操作分处不同包，但最终汇入同一套 Fiber 工作循环。依赖保持单向，调用路径仍然能够连成闭环。
 

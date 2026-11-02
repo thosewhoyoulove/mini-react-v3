@@ -2,7 +2,7 @@
 
 [← 返回总目录](../../React设计与实现.md) · [上一章](./17-Scheduler与时间切片.md) · [下一章 →](./19-HostConfig抽象.md)
 
-一次普通 `setState` 还没渲染完，`root.render` 和 `startTransition` 又先后带来更新。正在计算的半棵 WIP 是从断点继续，还是回到根重新开始？新旧更新又该先处理哪一档？Lane 记录更新的紧急程度，让 reconciler 能在根上选出下一批工作。
+一次普通 `setState` 还没渲染完，`root.render` 和 `startTransition` 又先后带来更新。正在计算的半棵 WIP 是从断点继续，还是回到根重新开始？新旧更新又该先处理哪一档？Lane 把紧急程度记在 Fiber 和根上，reconciler 才能选出下一批工作。
 
 > 主文件：`packages/react-reconciler/src/fiberLanes.ts`、`workLoop.ts`
 
@@ -16,21 +16,21 @@ DefaultLane    = 0b010; // 2
 TransitionLane = 0b100; // 4
 ```
 
-每个 Lane 占一个比特位，多档更新可以用按位或放进同一个集合。比如 Default 与 Transition 同时待处理时，集合就是 `0b010 | 0b100 = 0b110`。
+每个 Lane 占一个比特位。多档更新用按位或放进同一个集合。Default 与 Transition 同时待处理时，集合是 `0b010 | 0b100 = 0b110`。
 
-优先级越高，置位越靠右。`getHighestPriorityLane(lanes)` 通过 `lanes & -lanes` 取出最低置位，所以从 `0b111` 得到的是 `0b001`，也就是 Sync。三个 Lane 的来源和执行路径如下：
+优先级越高，置位越靠右。`getHighestPriorityLane(lanes)` 用 `lanes & -lanes` 取出最低的那个 1。`0b111` 得到 `0b001`，也就是 Sync。三档的来源和执行路径是：
 
 | Lane | 更新从哪里来 | 后续执行方式 |
 | --- | --- | --- |
-| `SyncLane = 1` | `root.render(element)` 经 `updateContainer` 发起 | 微任务中的 `workLoopSync`，不中途让出 |
-| `DefaultLane = 2` | 普通 `setState` / reducer dispatch | Scheduler 的 `NormalPriority` 任务，可时间切片 |
-| `TransitionLane = 4` | `startTransition(() => setState(...))` 内的更新 | Scheduler 的 `LowPriority` 任务，可时间切片 |
+| `SyncLane = 1` | `root.render(element)` 经 `updateContainer` 发起 | 微任务中的 `workLoopSync`，循环内部不让出 |
+| `DefaultLane = 2` | 普通 `setState` / reducer dispatch | Scheduler 的 `NormalPriority`，可时间切片 |
+| `TransitionLane = 4` | `startTransition(() => setState(...))` 内的更新 | Scheduler 的 `LowPriority`，可时间切片 |
 
-`startTransition` 调用 `scope` 时，会暂时设置 `ReactCurrentBatchConfig.transition`。Hook dispatch 在更新入队时读取它：有 transition 就选择 Transition，否则选择 Default。Lane 标在更新传播经过的 Fiber 和根上，表达这次更新来自哪条路径、应当多快处理；它不是浏览器任务。
+`startTransition` 调用 `scope` 前，把 `ReactCurrentBatchConfig.transition` 设成一个对象，`finally` 里再恢复。Hook 在入队时读取它。有 transition 就选 Transition，否则选 Default。Lane 标在更新经过的 Fiber 和根上，表示这次更新该多快被根拣起来。它不是浏览器任务，数值也不等于 Scheduler 的五档优先级。
 
-第 17 章已经区分过 Lane 与 Scheduler Priority。本章只需记住它们的连接方式：SyncLane 直接走 `queueMicrotask`，Default 和 Transition 则分别映射到 Scheduler 的 Normal 和 Low。
+第 17 章区分过 Lane 与 Scheduler Priority。这里的连接方式是：SyncLane 走 `queueMicrotask`，Default 和 Transition 分别映射到 Scheduler 的 Normal 和 Low。
 
-官方 React 有更多 Lane，还要处理成组的 Transition Lane、过期和饥饿等情况。这里的 `1 / 2 / 4` 只用于讲清根级选档、插队和时间切片，并不表示 React 只有三种优先级。
+官方 React 有更多 Lane，还要处理成组的 Transition、过期和饥饿。这里的 `1 / 2 / 4` 用来讲清根级选档、插队和时间切片，并不表示 React 只有三种优先级。
 
 ## 18.2 根怎样选择并调度下一档工作
 
@@ -40,12 +40,14 @@ TransitionLane = 0b100; // 4
 root.pendingLanes = 0b010 | 0b100 = 0b110
 ```
 
-`pendingLanes` 是这个根尚未完成的 Lane 集合。更新从 Fiber 出发后，`scheduleUpdateOnFiberImpl` 先给源 Fiber 的 `lanes` 加上对应位，再沿 `return` 链把它合入祖先的 `childLanes`，最后写进根的 `pendingLanes`：
+`pendingLanes` 是这个根还没处理完的 Lane 集合。更新从某个 Fiber 出发后，`scheduleUpdateOnFiberImpl` 先调用 `markUpdateLaneFromFiberToRoot`。
+
+源 Fiber 和它的 `alternate` 都会或上这一位。原因是 `setState` 闭包里抓住的可能是 current，也可能是上一轮的 WIP，只标其中一棵，另一棵的 `beginWork` 就看不到这次更新。然后沿 `return` 往上，把同一位或进每个祖先以及祖先 alternate 的 `childLanes`。走到 `HostRoot` 后，返回它 `stateNode` 上的 `FiberRoot`。沿 `return` 找不到 HostRoot 时，才退回模块级 `currentRoot`。
 
 ```text
-sourceFiber.lanes 标当前节点
+sourceFiber.lanes 与 alternate.lanes 都标上
         │
-        ├─ 沿 return 把 lane 合进祖先 childLanes
+        ├─ 沿 return 把 lane 合进祖先和 alternate 的 childLanes
         │
         └─ 把 lane 合进 root.pendingLanes
                          │
@@ -53,36 +55,40 @@ sourceFiber.lanes 标当前节点
                 ensureRootIsScheduled
 ```
 
-根有了待办集合，`getNextLanes(root)` 按 Sync、Default、Transition 的顺序只选最高档；`getHighestPriorityLane(nextLanes)` 取出本次 callback 的优先级标记；`ensureRootIsScheduled(root)` 再比较已有预约，决定沿用、取消或重新投递。
+`getNextLanes(root)` 按 Sync、Default、Transition 的顺序只返回最高的一档，不会把 `0b110` 整包交出去。`0b110` 的下一档是 Default。Transition 留在 `pendingLanes` 里。`ensureRootIsScheduled(root)` 再用这一档和已经约好的回调比较。
 
 ```text
 pendingLanes
     │
     ▼
-getNextLanes
+getNextLanes          只返回最高一档
     ├─ Sync       → queueMicrotask → performSyncWorkOnRoot
     ├─ Default    → Scheduler(Normal) → performConcurrentWorkOnRoot
     └─ Transition → Scheduler(Low)    → performConcurrentWorkOnRoot
 ```
 
-如果同档 callback 已经存在，`ensureRootIsScheduled` 直接复用。连续三次普通 `setState` 的 action 会留在 Hook 队列中，根只需要一个 Default callback，而不是预约三次。
+普通 `setState` 会把 Scheduler 任务 id 记到 `root.callbackNode`，并把档位记到 `callbackPriority`。同档回调已经存在时，`ensureRootIsScheduled` 直接返回。连续三次普通 `setState` 的 action 都留在 Hook 队列里，根上只保留一个 Default 回调。
 
-新选出的档位不同，尚未开始的旧 Scheduler callback 会被 `unstable_cancelCallback` 作废，再按新档位投递。比如 Low callback 还在等待时来了 Default 更新，根会改约 Normal callback。被替换的只是 callback 预约，TransitionLane 仍保留在 `pendingLanes`。
+Sync 不写 `callbackNode`。同一轮事件里的多次 `root.render` 靠 `syncScheduled` 合成一个微任务，后一次调用只把 `syncRoot` 改成最新的那个根。这和 Default 的“同档复用”不是同一个字段。
 
-一轮渲染完成后，`markRootFinished` 只删除本轮的 `renderedLanes`。若原集合是 `Sync | Default`，Sync commit 后还剩 Default；`finishRoot` 再次调用 `ensureRootIsScheduled`，剩下的 Default 才拿到 callback。Scheduler 在这段过程里只认识 callback 和 Priority，根上的 Lane 选择及剩余工作始终由 reconciler 维护。
+新档位不同，而且旧的 Scheduler 回调还没开始，才会 `unstable_cancelCallback`。例如 Low 回调还在堆里时来了 Default，根会改约 Normal。被替换的是回调预约。TransitionLane 仍留在 `pendingLanes`。并发回调若已经开始，函数入口会先把 `callbackNode` 清空，这时取消旧 id 已经不起作用，剩下的事交给 18.3 的重启判断。
+
+一轮渲染完成后，`markRootFinished` 只从 `pendingLanes` 里删掉本轮的 `renderedLanes`。原集合若是 `Sync | Default`，Sync 提交后还剩 Default。`finishRoot` 会再次调用 `ensureRootIsScheduled`，Default 这才拿到自己的回调。Scheduler 这段时间只认识 callback 和 Priority。哪一档还没做完，始终记在根上。
 
 ## 18.3 何时续跑何时重启，以及能跳过什么
 
-并发渲染第一次开始时，`prepareFreshStack` 从根创建 WIP。`workLoopConcurrent` 每做完一个 Fiber 都调用 `unstable_shouldYield()`。5ms 时间片用完后，全局 `workInProgress` 保留着下一个节点：
+并发渲染第一次开始时，`prepareFreshStack` 从根创建 WIP。`workLoopConcurrent` 每做完一个 Fiber 都调用 `unstable_shouldYield()`。5ms 用完后，全局 `workInProgress` 停在下一个节点：
 
 ```text
 第一拍：A → B → C → 时间到，workInProgress 指向 D
 第二拍：从 D 继续 → E → F → 完成
 ```
 
-只要期间没有新更新，下一次 Scheduler callback 就能从 D 接着做。若渲染过程中又有 action 入队，旧 WIP 上已经执行过 `beginWork` 的节点可能看不到它，此时是否续跑要重新判断。
+这段时间若没有新更新，下一次 Scheduler 回调从 D 接着做。`performConcurrentWorkOnRoot` 只有在 `workInProgress == null` 时才重新 `prepareFreshStack`。断点还在，就不会从根再克隆一棵。
 
-`shouldRestartCurrentRender` 处理的正是这种情况。同一个 root 收到同档或更高优更新时，它会设置 `rootNeedsRestart`，让半成品 WIP 被丢弃，并从根重新执行 `prepareFreshStack`。更低优更新只加入 `pendingLanes`，当前轮继续，等 commit 后再处理。Sync 更新除了要求重启，还会取消旧 Scheduler callback，改走微任务；`performSyncWorkOnRoot` 清空断点，用 `workLoopSync` 一次跑完。
+渲染过程中又有 action 入队时，已经执行过 `beginWork` 的节点不会自动再跑一遍。`shouldRestartCurrentRender` 处理的是这种情况。同一个 root 正在渲染，且新 Lane 与本轮优先级相同或更高，就把 `rootNeedsRestart` 设为 true。更低的 Lane 只进入 `pendingLanes`，不要求重来。
+
+这个标记不会把正在执行的 `performUnitOfWork` 从中途打断，`workLoopConcurrent` 的循环里也不读它。原因是 JavaScript 只有在这次循环回到 `performConcurrentWorkOnRoot` 之后才有检查点。结果是：当前这 5ms 里已经排上的节点仍会走完，然后 WIP 被清空，这次不 commit，再按新的最高档重新 schedule。Sync 循环内部没有 `shouldYield`，所以一旦在同步渲染途中又来了同档或更高档更新，这次 `workLoopSync` 会先把整棵树走完，再丢掉结果，留到下一个微任务重做。
 
 ```text
 只是 shouldYield
@@ -91,22 +97,33 @@ getNextLanes
 
 同档 / 更高档更新到来
   → rootNeedsRestart = true
-  → 丢弃 workInProgress
-  → 从 HostRoot 重建 WIP
+  → 当前这段 workLoop 返回后丢弃 workInProgress
+  → 不 commit，随后从 HostRoot 重建 WIP
+
+更低档更新到来
+  → 只并进 pendingLanes
+  → 当前轮可以继续，commit 后再 schedule
 ```
 
-Lane 不只在根上选档，也参与 Fiber 级 bailout。`beginWork` 的 `canSkipUpdate` 会查看 `fiber.lanes` 和 `fiber.childLanes` 是否都与 `renderLanes` 无交集，同时确认 props、ref 未变且 context 没有变化。全部满足时，函数组件、Fragment、Provider、ForwardRef、Memo、Suspense 等分支可以复用已有结果。`completeWork` 再把孩子的 `lanes / childLanes` 汇总到父级，供下一轮判断。
+Sync 更新除了可能要求重启，还会去约微任务。若旧的 Scheduler 回调还没开始，`ensureRootIsScheduled` 会先取消它。`performSyncWorkOnRoot` 自己也会把 `workInProgress` 清空，再用 `workLoopSync` 从新的 `prepareFreshStack` 跑。它不会接着 Default 留下的半成品。
 
-不过，跳过只做到 Fiber 这一层。这里的 Hook Update 没有 `lane` 字段；`updateState` 或 `updateReducer` 一旦进入某条 Hook 队列，就会按入队顺序重放整环 action，并清空 `baseQueue`。高优 render 可能顺带消费同一队列中的低优 action，而根上残留的低优 Lane 之后仍会触发一次可能多余的渲染。
+Lane 也参与 Fiber 级 bailout。`beginWork` 里，函数组件、Fragment、Provider、ForwardRef、Memo、Suspense 会问 `canSkipUpdate`。要同时满足：自己的 `lanes` 和 `childLanes` 都与 `renderLanes` 无交集，props 浅比较相同，ref 相同，context 没变，并且没有 `DidCapture`。满足时组件函数不执行，直接克隆已有的子 Fiber。
 
-生产版 React 会给 Update 携带 Lane，保留被跳过的更新和基准状态，之后再 rebase。这里实现的是 Fiber 级 bailout，不包含 Update 级筛选；阅读这份源码时，应把两层能力分开。
+`HostRoot`、`HostComponent` 和 `HostText` 不走这道判断。宿主节点仍会进入 `completeWork`，在那里比较 props 或文本。`completeWork` 再把孩子的 `lanes` 和 `childLanes` 汇总到父级的 `childLanes`，供下一轮使用。
+
+跳过只做到 Fiber 这一层。Hook Update 没有 `lane` 字段。`updateState` 或 `updateReducer` 一旦执行，就按入队顺序重放整圈 action，并清空 WIP 的 `baseQueue`。所以高优 render 只有在组件真的执行了这两个函数时，才会把同一条队列里的低优 action 一起算掉。组件若 bailout，action 还在队列里，等自己那一档渲染。
+
+根上残留的低优 Lane 不一定会因为 action 已经被高优渲染消费而消失。`markRootFinished` 只删除本轮 `renderedLanes`。之后仍可能再调度一次，进入组件时队列已经是空的。
+
+生产版 React 会给 Update 带上 Lane，把跳过的更新和基准状态留下来再 rebase。这里是 Fiber 级 bailout，加上“进入队列就整圈消费”。阅读时要把这两层分开。
 
 ## 本章回顾
 
-- 三档 Lane 分别来自 `root.render`、普通 Hook dispatch 和 `startTransition` 中的 Hook dispatch，优先级按 Sync、Default、Transition 递减。
-- 根从 `pendingLanes` 选择最高档，再把 Default / Transition 映射为 Scheduler 的 Normal / Low；Sync 绕过 Scheduler，走微任务。
-- 时间片耗尽时保留断点，同档或更高档更新到来时从根重启，更低档更新留到当前 commit 之后。
-- Fiber 可以按 `lanes / childLanes` bailout，但 Hook Update 没有 Lane，进入队列后仍会整队消费。
+- 三档 Lane 分别来自 `root.render`、普通 Hook dispatch 和 `startTransition` 中的 Hook dispatch。优先级按 Sync、Default、Transition 递减。
+- 标 Lane 时源 Fiber 和 alternate 都要写。根每次只取出 `pendingLanes` 里最高的一档。
+- Default 的重复调度靠 `callbackNode` 合并。同一轮里的多个 Sync 靠一个微任务槽合并，后写的 `syncRoot` 会覆盖前一个。
+- 时间片耗尽时保留断点。同档或更高档更新要等当前 `workLoop` 返回后才丢弃 WIP。更低档留到这次 commit 之后。
+- 一部分 Fiber 可以按 `lanes / childLanes` bailout。Hook Update 没有 Lane，函数真的执行时仍会整队消费。
 
 ### 源码入口
 
