@@ -100,16 +100,14 @@ root.render(element)
 
 更新已有节点时，`completeWork` 比较新旧 props 或文本。props 比较会跳过 `children`，因为孩子由子 Fiber 负责。有差异才打 `Update`。Mutation 阶段随后调用 `commitUpdate` 或 `commitTextUpdate`。首次 props 则在 `createInstance → applyProps` 里直接写入。本项目没有展开官方 HostConfig 里的 `prepareUpdate`、`finalizeInitialChildren`。这些接口不影响这里的主线。
 
-还有一项和运行上下文有关的限制。每个 `FiberRoot` 保存自己的 `hostConfig`。`createContainer` 会立刻 `setHostConfig`，每次 `performSyncWorkOnRoot` / `performConcurrentWorkOnRoot` 开始时也会再设一次。`completeWork` 和 `commitWork` 都通过 `getHostConfig()` 读取模块级 `currentHostConfig`。读取之后没有栈可以恢复上一层。
-
-`currentRoot` 是另一根指针。`createContainer` 把它指到最新创建的根。正常更新会顺着 `return` 找到 HostRoot，再取 `stateNode`。只有这条链找不到时，`getFiberRoot` 才退回 `currentRoot`。
+还有一项和运行上下文有关的实现选择。每个 `FiberRoot` 保存自己的 `hostConfig`，`completeWork` 和 `commitWork` 通过 `hostContext` 的当前值读取它。每次 root 开始 Render 或 Commit 前，`workLoop` 都先把该 root 的 HostConfig 注入当前上下文；同步阶段与并发阶段都会这样做。
 
 ```text
 FiberRoot.hostConfig ── setHostConfig ──► currentHostConfig
-后创建的 FiberRoot ────────────────────► currentRoot
+每个 root 开始工作时 ───────────────────► 重新注入自己的 HostConfig
 ```
 
-这些共享指针让单 root 的调用链很短。一旦在某个 root 的 Render 或 Commit 途中创建另一个 root，或者两个 root 的工作交错重入，`currentHostConfig` 就会被改到另一份实现上，而原来的工作循环不会自动改回来。本项目展示的是单 root 下的 HostConfig 注入。官方 React 会把宿主方法构建进各自的 reconciler，不靠运行时切换这样一个全局指针。
+因此这个教学实现仍然把 HostConfig 读取做成了一个模块级接缝，但 root 的真实配置和工作指针都由各自的 `FiberRoot` 保存。`syncRoots` 会在同一轮同步更新中逐个处理多个 root，P0 回归测试也验证两个 root 不会互相覆盖。教学实现没有把完整宿主配置对象复制进每个 Fiber；这仍是它与官方 reconciler 的简化边界。
 
 ## 本章回顾
 
@@ -117,7 +115,7 @@ FiberRoot.hostConfig ── setHostConfig ──► currentHostConfig
 - mount 时先在 complete 阶段按自底向上组装离线宿主树，再由 Commit 的 Placement 把顶层节点接入 Container。
 - 同一个 `appendChild` 既用于离线组装，也用于向已挂载父节点插入。`insertBefore` 只出现在 Commit。
 - Container 与普通 Instance 在 Fiber 上的来源不同。ref 属于 reconciler 的 commit 语义，不是 HostConfig 的属性操作。
-- 模块级 `currentHostConfig` 和 `currentRoot` 适合讲解单 root。它们没有调用栈，不能隔离交错执行的多个 root。
+- `FiberRoot` 保存自己的 HostConfig、工作指针和调度状态；工作循环开始时把当前 root 的 HostConfig 注入宿主上下文，因此多个 root 的更新不会共享同一个 root 指针。
 
 ### 源码入口
 
@@ -125,7 +123,7 @@ FiberRoot.hostConfig ── setHostConfig ──► currentHostConfig
 - `packages/react-reconciler/src/hostContext.ts`：模块级 `currentHostConfig`
 - `packages/react-reconciler/src/completeWork.ts`：创建实例、组装离线子树
 - `packages/react-reconciler/src/commitWork.ts`：Placement、删除、更新与 Layout ref
-- `packages/react-reconciler/src/workLoop.ts`：`currentRoot`、root 上的 HostConfig 注入
+- `packages/react-reconciler/src/workLoop.ts`：root 级 HostConfig 注入与多 root 调度
 - `packages/react-dom/src/hostConfig.ts`：DOM 平台实现
 
 ---

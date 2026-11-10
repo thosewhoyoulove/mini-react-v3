@@ -1,6 +1,17 @@
 import type { ReactElement } from 'react';
-import { createContainer, updateContainer } from 'react-reconciler';
-import { ensureRootClickDelegation, hostConfig } from './hostConfig';
+import {
+  createContainer,
+  formatDebugFiberTree,
+  inspectFiberRootState,
+  inspectFiberTree,
+  unmountContainer,
+  updateContainer,
+} from 'react-reconciler';
+import {
+  ensureRootClickDelegation,
+  hostConfig,
+  removeRootClickDelegation,
+} from './hostConfig';
 
 /**
  * ReactDOM 的根入口。
@@ -16,6 +27,19 @@ export function createRoot(container: Element) {
   return {
     render(element: ReactElement) {
       updateContainer(element, root);
+    },
+    unmount() {
+      unmountContainer(root);
+      removeRootClickDelegation(container);
+    },
+    inspectFiberTree() {
+      return inspectFiberTree(root);
+    },
+    inspectFiberRootState() {
+      return inspectFiberRootState(root);
+    },
+    formatFiberTree() {
+      return formatDebugFiberTree(root);
     },
   };
 }

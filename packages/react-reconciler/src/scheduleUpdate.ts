@@ -9,11 +9,11 @@ import { DefaultLane, type Lane } from './fiberLanes';
  */
 
 /** workLoop 注入的 scheduleUpdateOnFiberImpl。 */
-let impl: ((fiber: Fiber, lane: Lane) => void) | null = null;
+let impl: ((fiber: Fiber, lane: Lane, updateId?: number) => void) | null = null;
 
 /** 模块初始化时登记真正的调度入口。 */
 export function setScheduleUpdateOnFiber(
-  fn: (fiber: Fiber, lane: Lane) => void,
+  fn: (fiber: Fiber, lane: Lane, updateId?: number) => void,
 ): void {
   impl = fn;
 }
@@ -22,9 +22,10 @@ export function setScheduleUpdateOnFiber(
 export function scheduleUpdateOnFiber(
   fiber: Fiber,
   lane: Lane = DefaultLane,
+  updateId?: number,
 ): void {
   if (impl == null) {
     throw new Error('scheduleUpdateOnFiber is not initialized');
   }
-  impl(fiber, lane);
+  impl(fiber, lane, updateId);
 }

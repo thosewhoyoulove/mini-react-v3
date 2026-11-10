@@ -2,6 +2,7 @@ import {
   NormalPriority,
   unstable_scheduleCallback,
 } from 'scheduler';
+import { debugLog } from 'shared';
 import {
   ForwardRef,
   FunctionComponent,
@@ -44,6 +45,48 @@ import {
  * 同一条 Hook 链表上两种 effect 混排，用 HookLayout / HookPassive 过滤。
  * useLayoutEffect 打的是 Update（和 Host DOM 更新共用），按 fiber.tag 分叉。
  */
+
+/** 只读取 Fiber 身份，不执行函数组件，供 Commit 日志显示。 */
+function getDebugComponent(fiber: Fiber): string | null {
+  if (typeof fiber.type === 'string') {
+    return fiber.type;
+  }
+  if (typeof fiber.type === 'function') {
+    return fiber.type.name || 'Anonymous';
+  }
+  return null;
+}
+
+/** 计算 Fiber 在 return 链上的深度，让调试面板能按树层级缩进。 */
+function getFiberDepth(fiber: Fiber): number {
+  let depth = 0;
+  let parent = fiber.return;
+  while (parent != null) {
+    depth += 1;
+    parent = parent.return;
+  }
+  return depth;
+}
+
+/** 把一次 Commit 中某个 Fiber 的阶段写成结构化事件。 */
+function logCommitFiber(
+  root: FiberRoot,
+  phase: 'mutation' | 'layoutEffect' | 'passiveEffect',
+  message: string,
+  fiber: Fiber,
+  updateId: number | null = root.debugUpdateId,
+): void {
+  debugLog('trace', {
+    phase,
+    message,
+    component: getDebugComponent(fiber),
+    fiberTag: String(fiber.tag),
+    lane: root.workInProgressRootRenderLanes,
+    flags: fiber.flags,
+    depth: getFiberDepth(fiber),
+    updateId,
+  });
+}
 
 /** HostComponent 和 HostRoot 才能直接承接宿主节点。 */
 function isHostParent(fiber: Fiber): boolean {
@@ -312,8 +355,14 @@ function commitWork(finishedWork: Fiber): void {
  *
  * Placement 和 Update 可能同时存在，必须用两个 if 分别消费，不能互斥。
  */
-function commitMutationEffectsOnFiber(finishedWork: Fiber): void {
+function commitMutationEffectsOnFiber(
+  finishedWork: Fiber,
+  root: FiberRoot,
+): void {
   const flags = finishedWork.flags;
+  if ((flags & MutationMask) !== 0) {
+    logCommitFiber(root, 'mutation', 'mutation effects on Fiber', finishedWork);
+  }
 
   if ((flags & ChildDeletion) !== 0 && finishedWork.deletions != null) {
     for (const childToDelete of finishedWork.deletions) {
@@ -325,7 +374,7 @@ function commitMutationEffectsOnFiber(finishedWork: Fiber): void {
   if ((finishedWork.subtreeFlags & MutationMask) !== 0) {
     let child = finishedWork.child;
     while (child != null) {
-      commitMutationEffectsOnFiber(child); // 2
+      commitMutationEffectsOnFiber(child, root); // 2
       child = child.sibling;
     }
   }
@@ -352,11 +401,17 @@ function commitMutationEffectsOnFiber(finishedWork: Fiber): void {
  *   2. 带 Ref → 写入宿主实例或函数组件 Fiber；卸载路径另走 detachRefs
  *   3. 函数组件 / memo / forwardRef 带 Update → 跑 useLayoutEffect create
  */
-function commitLayoutEffectsOnFiber(finishedWork: Fiber): void {
+function commitLayoutEffectsOnFiber(
+  finishedWork: Fiber,
+  root: FiberRoot,
+): void {
+  if ((finishedWork.flags & LayoutMask) !== 0) {
+    logCommitFiber(root, 'layoutEffect', 'layout effects on Fiber', finishedWork);
+  }
   if ((finishedWork.subtreeFlags & LayoutMask) !== 0) {
     let child = finishedWork.child;
     while (child != null) {
-      commitLayoutEffectsOnFiber(child); // 1
+      commitLayoutEffectsOnFiber(child, root); // 1
       child = child.sibling;
     }
   }
@@ -369,11 +424,18 @@ function commitLayoutEffectsOnFiber(finishedWork: Fiber): void {
 }
 
 /** 深度优先执行本轮 deps 变化的 Passive cleanup。 */
-function commitPassiveUnmountOnFiber(finishedWork: Fiber): void {
+function commitPassiveUnmountOnFiber(
+  finishedWork: Fiber,
+  root: FiberRoot,
+  updateId: number | null,
+): void {
+  if ((finishedWork.flags & Passive) !== 0 && hasHookList(finishedWork)) {
+    logCommitFiber(root, 'passiveEffect', 'passive cleanup on Fiber', finishedWork, updateId);
+  }
   if ((finishedWork.subtreeFlags & PassiveMask) !== 0) {
     let child = finishedWork.child;
     while (child != null) {
-      commitPassiveUnmountOnFiber(child);
+      commitPassiveUnmountOnFiber(child, root, updateId);
       child = child.sibling;
     }
   }
@@ -386,11 +448,18 @@ function commitPassiveUnmountOnFiber(finishedWork: Fiber): void {
 }
 
 /** 深度优先执行本轮 deps 变化的 Passive create。 */
-function commitPassiveMountOnFiber(finishedWork: Fiber): void {
+function commitPassiveMountOnFiber(
+  finishedWork: Fiber,
+  root: FiberRoot,
+  updateId: number | null,
+): void {
+  if ((finishedWork.flags & Passive) !== 0 && hasHookList(finishedWork)) {
+    logCommitFiber(root, 'passiveEffect', 'passive create on Fiber', finishedWork, updateId);
+  }
   if ((finishedWork.subtreeFlags & PassiveMask) !== 0) {
     let child = finishedWork.child;
     while (child != null) {
-      commitPassiveMountOnFiber(child);
+      commitPassiveMountOnFiber(child, root, updateId);
       child = child.sibling;
     }
   }
@@ -402,12 +471,6 @@ function commitPassiveMountOnFiber(finishedWork: Fiber): void {
   }
 }
 
-/** 已经约了一次 flush，还没执行。避免每次 commit 都再约一个回调。 */
-let rootDoesHavePassiveEffects = false;
-
-/** 等绘制后要跑 Passive 的那棵已提交树。 */
-let pendingPassiveEffects: Fiber | null = null;
-
 /**
  * 跑上一轮（或本轮约好的）useEffect：先全树 destroy，再全树 create。
  *
@@ -416,15 +479,17 @@ let pendingPassiveEffects: Fiber | null = null;
  *   2. 摘掉 pending / 预约标记，避免回调重入再跑一遍
  *   3. 先 unmount 再 mount（和官方 flushPassiveEffects 一样）
  */
-function flushPassiveEffects(): void {
-  if (pendingPassiveEffects == null) {
+function flushPassiveEffects(root: FiberRoot): void {
+  if (root.pendingPassiveEffects == null) {
     return; // 1
   }
-  const finishedWork = pendingPassiveEffects;
-  pendingPassiveEffects = null; // 2
-  rootDoesHavePassiveEffects = false;
-  commitPassiveUnmountOnFiber(finishedWork); // 3
-  commitPassiveMountOnFiber(finishedWork);
+  const finishedWork = root.pendingPassiveEffects;
+  const updateId = root.pendingPassiveEffectsUpdateId;
+  root.pendingPassiveEffects = null; // 2
+  root.pendingPassiveEffectsUpdateId = null;
+  root.passiveEffectsScheduled = false;
+  commitPassiveUnmountOnFiber(finishedWork, root, updateId); // 3
+  commitPassiveMountOnFiber(finishedWork, root, updateId);
 }
 
 /**
@@ -450,24 +515,25 @@ export function commitRoot(root: FiberRoot): void {
   }
   root.finishedWork = null;
 
-  flushPassiveEffects(); // 1
+  flushPassiveEffects(root); // 1
 
   const hasPassiveEffects =
     (finishedWork.flags & PassiveMask) !== 0 ||
     (finishedWork.subtreeFlags & PassiveMask) !== 0;
 
   commitBeforeMutationEffects(finishedWork); // 2
-  commitMutationEffectsOnFiber(finishedWork); // 3
+  commitMutationEffectsOnFiber(finishedWork, root); // 3
   root.current = finishedWork;
 
-  commitLayoutEffectsOnFiber(finishedWork); // 4
+  commitLayoutEffectsOnFiber(finishedWork, root); // 4
 
   if (hasPassiveEffects) {
-    pendingPassiveEffects = finishedWork; // 5
-    if (!rootDoesHavePassiveEffects) {
-      rootDoesHavePassiveEffects = true;
+    root.pendingPassiveEffects = finishedWork; // 5
+    root.pendingPassiveEffectsUpdateId = root.debugUpdateId;
+    if (!root.passiveEffectsScheduled) {
+      root.passiveEffectsScheduled = true;
       unstable_scheduleCallback(NormalPriority, () => {
-        flushPassiveEffects();
+        flushPassiveEffects(root);
       });
     }
   }

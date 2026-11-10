@@ -9,6 +9,7 @@
 - [按主题查章节与源码](#按主题查章节与源码)
 - [与 `INTERVIEW.md` 的面试映射](#与-interviewmd-的面试映射)
 - [用 demo 验证](#用-demo-验证)
+- [Debug Logger 与 Fiber Inspector](#debug-logger-与-fiber-inspector)
 - [教学实现与官方 React 的差异](#教学实现与官方-react-的差异)
 - [仓库未实现清单](#仓库未实现清单)
 
@@ -67,6 +68,8 @@
 | `subtreeFlags` | 子树 Flags 的汇总，让 Commit 能跳过无副作用子树。 |
 | Hook 链表 | 函数组件 Fiber 的 `memoizedState` 指向的顺序链表。 |
 | Lane | Reconciler 中表示更新优先级的 bit；本仓库可据此在 Fiber 层 bailout，但不能按 Lane 筛选单条 Hook Update。 |
+| `Fiber Inspector` | 从 `FiberRoot.current` 复制出可序列化的 child / sibling 树，适合 Demo 或测试展示。 |
+| `Debug Logger` | 默认关闭的结构化事件通道，用 `updateId` 把一次更新串起 schedule、Render、Commit 和 Effect。 |
 | Scheduler | 用优先级最小堆排列 callback；宏任务提供执行机会，5ms 截止时间供工作循环判断是否让出。 |
 | HostConfig | Reconciler 调用的宿主能力接口；运行时提供 DOM 实现，测试使用内存实现。 |
 
@@ -87,6 +90,7 @@
 | Scheduler / Lane | [第 17 章](./17-Scheduler与时间切片.md)、[第 18 章](./18-最小Lane.md) | `packages/scheduler/src/Scheduler.ts`、`packages/react-reconciler/src/fiberLanes.ts`、`packages/react-reconciler/src/workLoop.ts` |
 | HostConfig / DOM | [第 19 章](./19-HostConfig抽象.md)、[第 20 章](./20-DOM属性与简易事件.md) | `packages/react-reconciler/src/HostConfig.ts`、`packages/react-dom/src/hostConfig.ts` |
 | 根入口 | [第 21 章](./21-createRoot与updateContainer.md) | `packages/react-dom/src/client.ts`、`packages/react-reconciler/src/reconciler.ts`、`packages/react-reconciler/src/workLoop.ts` |
+| 调试观察 | 本附录“Debug Logger 与 Fiber Inspector” | `packages/shared/src/Debug.ts`、`packages/react-reconciler/src/DebugFiber.ts`、`demos/hello-dom/src/main.ts` |
 
 ## 与 `INTERVIEW.md` 的面试映射
 
@@ -104,7 +108,7 @@
 
 ## 用 demo 验证
 
-demo 入口是 `demos/hello-dom/src/main.ts`。运行 `pnpm dev` 后，页面按 State、Keyed Diff、Effect 拆成三个独立实验：
+demo 入口是 `demos/hello-dom/src/main.ts`。运行 `pnpm dev` 后，页面按 State、Keyed Diff、Effect、bailout、Context、边界、时间切片和双缓冲拆成八个独立实验：
 
 **State 卡片：DefaultLane、更新队列与文本更新**
 
@@ -125,9 +129,36 @@ demo 入口是 `demos/hello-dom/src/main.ts`。运行 `pnpm dev` 后，页面按
 - Passive cleanup / create 由 Scheduler 放到后续宏任务，日志顺序与 Layout 分开。
 - 点 `unmount`：教学版会在 Mutation 中同步执行被删子树的 Layout 与 Passive cleanup，这是与官方删除路径不同的简化。
 
+**时间切片卡片：work unit 与 shouldYield**
+
+- 先把 Debug Logger 切到 `trace`，再点击“重新计算 120 个组件”。每个 `SliceItem` 都做少量计算，故意让 DefaultLane 工作跨过多个 5ms 切片。
+- `render` 日志会记录本次切片执行了多少个 work unit，以及 `shouldYield` 是否触发；下一条 Scheduler 宏任务从 `root.workInProgress` 继续。
+- 首屏 `root.render` 使用 SyncLane，走微任务中的 `workLoopSync`，所以不会显示为可让出的并发切片。
+
+**双缓冲卡片：current、WIP 与 alternate**
+
+- 点击“执行一次更新”前会读取当前 HostRoot；Layout 阶段再次读取，能看到 Commit 后 `root.current` 已切到刚完成的 WIP。
+- `inspectFiberRootState()` 只返回可序列化的 Fiber 身份字符串，不暴露内部 Fiber；`current.alternate` 用来核对两格 Fiber 始终互相配对。
+
 首次进入页面则是：`createRoot().render(...)` → `SyncLane` → 微任务中的同步工作循环。它与 `+1` 共用 begin / complete / commit 主线，差别在 Lane 和是否存在 current 子树。
 
 自动验证运行 `pnpm test`。内存 HostConfig 会保留宿主节点对象身份，所以测试不仅检查最终文本，还能证明 keyed Diff 是复用并移动旧节点。`pnpm typecheck` 同时检查所有 packages、demo 和测试源码。
+
+## Debug Logger 与 Fiber Inspector
+
+调试通道位于 `packages/shared/src/Debug.ts`，默认级别是 `off`，因此不会改变现有 Demo 和测试的输出。调用 `configureDebug({ level, sink })` 后，sink 会收到普通对象形式的 `DebugLogEntry`。每次 `root.render` 或 Hook `setState` 都会分配一个 `updateId`，日志会把它带过调度、`beginWork`、`completeWork`、Commit 和 Effect 阶段。
+
+Demo 页面底部的调试面板可以切换 `info` 或 `trace`。`info` 适合看一次更新从哪里进入调度，`trace` 会把每个工作 Fiber 和 Commit 阶段也列出来；并发 Render 还会记录每个切片的 work unit 数和 `shouldYield` 结果。面板直接消费结构化事件，不把日志状态放回 React 树，避免调试输出反过来制造更新。
+
+`createRoot` 返回的对象提供 `formatFiberTree()`。点击“刷新 Fiber 树”会从 `root.current` 复制出 `child / sibling` 结构，输出类似下面的教学树：
+
+```text
+HostRoot(HostRoot) key=null flags=NoFlags
+└── FunctionComponent(App) key=null flags=NoFlags
+    └── HostComponent(main) key=null flags=NoFlags
+```
+
+这个 Inspector 只读 Fiber 的导航和调试字段，不返回完整 Fiber，因此 Demo 可以展示树结构而不会暴露 Hook 队列、DOM 实例等内部对象。双缓冲实验使用同一原则，通过 `inspectFiberRootState()` 只展示 current、workInProgress 和 alternate 的可读身份。
 
 ## 教学实现与官方 React 的差异
 
@@ -152,7 +183,7 @@ demo 入口是 `demos/hello-dom/src/main.ts`。运行 `pnpm dev` 后，页面按
 - 完整 Lane 集合、单条 Update 的 Lane 跳过与 rebase、Scheduler 过期和饥饿策略
 - SSR / hydrate、`flushSync`
 - 完整的 ref 语义（宿主对象 ref、函数 ref 与 forwardRef 主路径已实现）
-- style 对象细粒度 Diff、`dangerouslySetInnerHTML`
+- Debug Logger 目前只记录结构化教学事件，不包含官方 DevTools 协议、性能时间线或远程采样
 
 这些缺口不影响解释本仓库的核心闭环：描述 UI → 构建 Fiber → 可切片 Render → 同步 Commit。遇到清单外的官方能力，应明确“本仓库未实现”，再回到已验证的主线。
 

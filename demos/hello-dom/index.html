@@ -106,10 +106,80 @@
         margin: 14px 0 0;
         font-size: 13px;
       }
+      .debug-panel {
+        width: min(1100px, calc(100% - 32px));
+        margin: 24px auto 48px;
+        padding: 18px;
+        border: 1px solid #2a3856;
+        border-radius: 14px;
+        color: #d7e1ff;
+        background: #111a2d;
+        box-shadow: 0 8px 30px rgb(17 26 45 / 18%);
+      }
+      .debug-panel h2 {
+        margin-bottom: 8px;
+        color: #fff;
+      }
+      .debug-toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+        margin: 12px 0;
+      }
+      .debug-toolbar select {
+        padding: 7px 10px;
+        border: 1px solid #52658f;
+        border-radius: 8px;
+        color: #d7e1ff;
+        background: #1b2944;
+      }
+      .debug-status {
+        color: #91a4ca;
+        font-family: "SFMono-Regular", Consolas, monospace;
+        font-size: 12px;
+      }
+      .debug-log,
+      .debug-tree {
+        min-height: 60px;
+        max-height: 260px;
+        overflow: auto;
+        margin: 8px 0 0;
+        padding: 12px;
+        border: 1px solid #2a3856;
+        border-radius: 8px;
+        color: #d7e1ff;
+        background: #0b1220;
+        font-family: "SFMono-Regular", Consolas, monospace;
+        font-size: 12px;
+        line-height: 1.6;
+      }
+      .debug-log {
+        padding-left: 34px;
+      }
+      .debug-tree {
+        white-space: pre;
+      }
     </style>
   </head>
   <body>
     <div id="root"></div>
+    <aside id="debug-panel" class="debug-panel" aria-label="mini-react 调试面板">
+      <h2>Debug Logger / Fiber Inspector</h2>
+      <div class="debug-toolbar">
+        <label for="debug-level">日志级别</label>
+        <select id="debug-level">
+          <option value="off" selected>off（关闭）</option>
+          <option value="info">info</option>
+          <option value="trace">trace（完整）</option>
+        </select>
+        <button id="debug-clear" type="button">清空</button>
+        <button id="debug-inspect" type="button">刷新 Fiber 树</button>
+        <span id="debug-status" class="debug-status">日志：off</span>
+      </div>
+      <ol id="debug-log" class="debug-log" aria-live="polite"></ol>
+      <pre id="debug-tree" class="debug-tree" aria-label="current Fiber 树"></pre>
+    </aside>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

@@ -6,5 +6,17 @@ export {
   REACT_MEMO_TYPE,
   REACT_SUSPENSE_TYPE,
 } from './ReactSymbols';
-export type { Key, Props, ReactElement, Ref, Type } from './ReactTypes';
 export { enableSchedulerDebugging } from './ReactFeatureFlags';
+export type { Key, Props, ReactElement, Ref, Type } from './ReactTypes';
+export {
+  configureDebug,
+  createDebugUpdateId,
+  debugLog,
+  getDebugConfig,
+} from './Debug';
+export type {
+  DebugConfig,
+  DebugLogEntry,
+  DebugLogLevel,
+  DebugPhase,
+} from './Debug';

@@ -42,7 +42,7 @@ root.pendingLanes = 0b010 | 0b100 = 0b110
 
 `pendingLanes` 是这个根还没处理完的 Lane 集合。更新从某个 Fiber 出发后，`scheduleUpdateOnFiberImpl` 先调用 `markUpdateLaneFromFiberToRoot`。
 
-源 Fiber 和它的 `alternate` 都会或上这一位。原因是 `setState` 闭包里抓住的可能是 current，也可能是上一轮的 WIP，只标其中一棵，另一棵的 `beginWork` 就看不到这次更新。然后沿 `return` 往上，把同一位或进每个祖先以及祖先 alternate 的 `childLanes`。走到 `HostRoot` 后，返回它 `stateNode` 上的 `FiberRoot`。沿 `return` 找不到 HostRoot 时，才退回模块级 `currentRoot`。
+源 Fiber 和它的 `alternate` 都会或上这一位。原因是 `setState` 闭包里抓住的可能是 current，也可能是上一轮的 WIP，只标其中一棵，另一棵的 `beginWork` 就看不到这次更新。然后沿 `return` 把同一位或进每个祖先以及祖先 alternate 的 `childLanes`。走到 `HostRoot` 后，返回它 `stateNode` 上的 `FiberRoot`；正常更新都能通过这条链找到所属 root。
 
 ```text
 sourceFiber.lanes 与 alternate.lanes 都标上
@@ -69,7 +69,7 @@ getNextLanes          只返回最高一档
 
 普通 `setState` 会把 Scheduler 任务 id 记到 `root.callbackNode`，并把档位记到 `callbackPriority`。同档回调已经存在时，`ensureRootIsScheduled` 直接返回。连续三次普通 `setState` 的 action 都留在 Hook 队列里，根上只保留一个 Default 回调。
 
-Sync 不写 `callbackNode`。同一轮事件里的多次 `root.render` 靠 `syncScheduled` 合成一个微任务，后一次调用只把 `syncRoot` 改成最新的那个根。这和 Default 的“同档复用”不是同一个字段。
+Sync 不把微任务任务号写进某个 root 的 `callbackNode`，而是用模块级的 `syncRoots` 集合记录本轮需要处理的根，再用 `syncScheduled` 保证只约一个微任务。微任务会逐个处理集合中的 root，不会用后一个 root 覆盖前一个 root。
 
 新档位不同，而且旧的 Scheduler 回调还没开始，才会 `unstable_cancelCallback`。例如 Low 回调还在堆里时来了 Default，根会改约 Normal。被替换的是回调预约。TransitionLane 仍留在 `pendingLanes`。并发回调若已经开始，函数入口会先把 `callbackNode` 清空，这时取消旧 id 已经不起作用，剩下的事交给 18.3 的重启判断。
 
@@ -121,7 +121,7 @@ Lane 也参与 Fiber 级 bailout。`beginWork` 里，函数组件、Fragment、P
 
 - 三档 Lane 分别来自 `root.render`、普通 Hook dispatch 和 `startTransition` 中的 Hook dispatch。优先级按 Sync、Default、Transition 递减。
 - 标 Lane 时源 Fiber 和 alternate 都要写。根每次只取出 `pendingLanes` 里最高的一档。
-- Default 的重复调度靠 `callbackNode` 合并。同一轮里的多个 Sync 靠一个微任务槽合并，后写的 `syncRoot` 会覆盖前一个。
+- Default 的重复调度靠 `callbackNode` 合并。同一轮里的多个 Sync 靠 `syncRoots` 集合和一个微任务槽合并，集合会保留每个待处理的 root。
 - 时间片耗尽时保留断点。同档或更高档更新要等当前 `workLoop` 返回后才丢弃 WIP。更低档留到这次 commit 之后。
 - 一部分 Fiber 可以按 `lanes / childLanes` bailout。Hook Update 没有 Lane，函数真的执行时仍会整队消费。
 

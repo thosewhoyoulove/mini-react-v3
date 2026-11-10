@@ -4,6 +4,7 @@ import { Passive, Update as UpdateFlag } from './fiberFlags';
 import type { ContextDependency, Fiber } from './fiber';
 import { DefaultLane, TransitionLane, type Lane } from './fiberLanes';
 import { scheduleUpdateOnFiber } from './scheduleUpdate';
+import { createDebugUpdateId, debugLog } from 'shared';
 
 /**
  * 函数组件的 Hook 实现。
@@ -231,7 +232,20 @@ function enqueueUpdate<S>(
     pending.next = update;
   }
   queue.pending = update; // 3
-  scheduleUpdateOnFiber(fiber, requestUpdateLane()); // 4
+  const lane = requestUpdateLane();
+  const updateId = createDebugUpdateId();
+  debugLog('trace', {
+    phase: 'scheduleUpdate',
+    message: 'update enqueued in Hook queue',
+    component:
+      typeof fiber.type === 'function' ? fiber.type.name || 'Anonymous' : null,
+    fiberTag: String(fiber.tag),
+    lane,
+    flags: fiber.flags,
+    depth: null,
+    updateId,
+  });
+  scheduleUpdateOnFiber(fiber, lane, updateId); // 4
 }
 
 function dispatchSetState(

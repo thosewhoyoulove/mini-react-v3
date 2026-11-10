@@ -13,9 +13,14 @@ import {
   useState,
 } from 'react';
 import { createRoot } from 'react-dom/client';
+import {
+  configureDebug,
+  type DebugLogEntry,
+  type DebugLogLevel,
+} from 'shared';
 
 /**
- * 教学 demo：把一条很长的功能演示拆成三个可以独立观察的实验。
+ * 教学 demo：把一条很长的功能演示拆成可以独立观察的实验。
  *
  * 1. StateDemo：观察函数式更新如何进入同一条 Hook 队列
  * 2. ListDemo：观察 key 如何决定复用、移动、新建和删除
@@ -23,7 +28,100 @@ import { createRoot } from 'react-dom/client';
  * 4. BailoutDemo：父更新跳过子函数；子更新会把父函数拉回来
  * 5. ContextDemo：value 不变时消费者被跳过；transition 可被高优更新丢掉
  * 6. BoundaryDemo：错误边界、Suspense fallback，以及容器上的 click 委托
+ * 7. TimeSliceDemo：观察并发切片执行的 work unit 和 shouldYield
+ * 8. DoubleBufferDemo：观察 current、workInProgress 与 alternate 的切换
  */
+
+/** 调试面板最多保留的日志条数，避免长时间点击导致页面无限增长。 */
+const maxDebugEntries = 120;
+
+/** 面板当前保留的结构化事件；Fiber 和 DOM 都不放进这里。 */
+const debugEntries: DebugLogEntry[] = [];
+
+/** Demo 用的根引用，只用于读取可序列化的调试快照，不参与调和。 */
+let demoRoot: ReturnType<typeof createRoot> | null = null;
+
+/** 把一条结构化事件压缩成面板中的单行文本。 */
+function formatDebugEntry(entry: DebugLogEntry): string {
+  const component = entry.component ?? entry.fiberTag ?? '-';
+  const updateId = entry.updateId == null ? '-' : String(entry.updateId);
+  const lane = entry.lane == null ? '-' : String(entry.lane);
+  const slice =
+    entry.workUnits == null
+      ? ''
+      : ` | work=${entry.workUnits} | yield=${entry.didYield ? 'yes' : 'no'}`;
+  return `${entry.phase} | ${component} | update#${updateId} | lane=${lane}${slice} | ${entry.message}`;
+}
+
+/** 把 Logger 事件追加到页面外置的原生日志列表，不触发 React 自身更新。 */
+function appendDebugEntry(entry: DebugLogEntry): void {
+  debugEntries.push(entry);
+  if (debugEntries.length > maxDebugEntries) {
+    debugEntries.shift();
+  }
+  if (entry.phase === 'render' && entry.workUnits != null) {
+    const metrics = document.getElementById('slice-metrics');
+    if (metrics != null) {
+      metrics.textContent =
+        `最近切片：${entry.workUnits} 个 work unit，shouldYield：${entry.didYield ? '触发' : '未触发'}`;
+    }
+  }
+  const log = document.getElementById('debug-log');
+  if (log == null) {
+    return;
+  }
+  const item = document.createElement('li');
+  item.textContent = formatDebugEntry(entry);
+  log.appendChild(item);
+  while (log.children.length > maxDebugEntries) {
+    log.firstElementChild?.remove();
+  }
+  log.scrollTop = log.scrollHeight;
+}
+
+/** 初始化 Debug Logger 面板，并把 Fiber Inspector 绑定到当前 DOM 根。 */
+function setupDebugPanel(root: ReturnType<typeof createRoot>): void {
+  const levelSelect = document.getElementById('debug-level') as HTMLSelectElement | null;
+  const status = document.getElementById('debug-status');
+  const clearButton = document.getElementById('debug-clear');
+  const inspectButton = document.getElementById('debug-inspect');
+  const tree = document.getElementById('debug-tree');
+
+  const setStatus = (message: string): void => {
+    if (status != null) {
+      status.textContent = message;
+    }
+  };
+
+  const currentLevel = (levelSelect?.value ?? 'off') as DebugLogLevel;
+  configureDebug({ level: currentLevel, sink: appendDebugEntry });
+  setStatus(`日志：${currentLevel}`);
+
+  levelSelect?.addEventListener('change', () => {
+    const level = levelSelect.value as DebugLogLevel;
+    configureDebug({ level });
+    setStatus(`日志：${level}`);
+  });
+
+  clearButton?.addEventListener('click', () => {
+    debugEntries.length = 0;
+    const log = document.getElementById('debug-log');
+    if (log != null) {
+      log.textContent = '';
+    }
+    if (tree != null) {
+      tree.textContent = '';
+    }
+    setStatus('日志已清空');
+  });
+
+  inspectButton?.addEventListener('click', () => {
+    if (tree != null) {
+      tree.textContent = root.formatFiberTree();
+    }
+    setStatus('已刷新 current Fiber 树');
+  });
+}
 
 /** 下一次追加列表项时使用的稳定编号，避免删除后产生重复 key。 */
 let nextItemId = 4;
@@ -431,7 +529,109 @@ function BoundaryDemo() {
   );
 }
 
-/** 页面入口：六张卡片共用同一个 FiberRoot，但各自维护独立 Hook 链表。 */
+/** 一个刻意带有少量计算的子组件，让每个 Fiber 更容易在时间片中被观察。 */
+function SliceItem(props: { index: number; revision: number }) {
+  let checksum = 0;
+  for (let step = 0; step < 18000; step += 1) {
+    checksum = (checksum + step + props.index + props.revision) & 255;
+  }
+  return createElement('li', null, `item ${props.index}: ${checksum}`);
+}
+
+/**
+ * 时间切片实验。
+ *
+ * 1. 点击按钮给本组件入队 DefaultLane 更新
+ * 2. 重新生成一组带 revision 的子组件，确保它们实际执行
+ * 3. Scheduler 在 work unit 之间检查 shouldYield，Debug Logger 记录每拍数量
+ * 4. 页面保持可交互；root.render 首屏仍走 SyncLane，不会进入这条路径
+ */
+function TimeSliceDemo() {
+  const [revision, setRevision] = useState(0);
+  const items = Array.from({ length: 120 }, (_, index) => index + 1);
+  return createElement(
+    'section',
+    { className: 'card' },
+    createElement('h2', null, '7. Scheduler 时间切片'),
+    createElement(
+      'div',
+      { className: 'row' },
+      createElement(
+        'button',
+        { onClick: () => setRevision((value) => value + 1) },
+        '重新计算 120 个组件',
+      ),
+    ),
+    createElement('p', { id: 'slice-metrics', className: 'value' }, '尚未执行并发切片'),
+    createElement(
+      'ul',
+      { className: 'chips' },
+      ...items.map((index) =>
+        createElement(SliceItem, { index, revision, key: index }),
+      ),
+    ),
+    createElement(
+      'p',
+      { className: 'hint' },
+      '先把日志切到 trace，再点击按钮；日志中的 render 记录显示每拍 work unit 和 shouldYield。',
+    ),
+  );
+}
+
+/** 把当前根的可序列化双缓冲快照写进实验卡片。 */
+function writeDoubleBufferSnapshot(label: string): void {
+  const panel = document.getElementById('double-buffer-state');
+  if (panel == null || demoRoot == null) {
+    return;
+  }
+  const state = demoRoot.inspectFiberRootState();
+  panel.textContent = [
+    label,
+    `current root: ${state.currentRootId}`,
+    `workInProgress root: ${state.workInProgressRootId ?? 'null（当前没有进行中的 Render）'}`,
+    `current.alternate: ${state.currentAlternateId ?? 'null（尚未 clone）'}`,
+    `WIP active: ${state.isWorkInProgressActive ? 'yes' : 'no'}`,
+  ].join('\n');
+}
+
+/**
+ * 双缓冲实验。
+ *
+ * 1. 点击按钮前读取 current，代表屏幕上已经提交的树
+ * 2. setState 让 reconciler 创建或复用 alternate 作为 WIP
+ * 3. Layout 阶段再次读取，展示 Commit 后 current 已经切换
+ * 4. 对比两个 root 身份，理解“改 WIP、提交后换 current”的关系
+ */
+function DoubleBufferDemo() {
+  const [version, setVersion] = useState(0);
+  useLayoutEffect(() => {
+    writeDoubleBufferSnapshot('Commit 后');
+  }, [version]);
+  return createElement(
+    'section',
+    { className: 'card' },
+    createElement('h2', null, '8. current / workInProgress 双缓冲'),
+    createElement('p', { className: 'value' }, `version: ${version}`),
+    createElement(
+      'button',
+      {
+        onClick: () => {
+          writeDoubleBufferSnapshot('更新前：current 仍指向已提交树');
+          setVersion((value) => value + 1);
+        },
+      },
+      '执行一次更新',
+    ),
+    createElement('pre', { id: 'double-buffer-state', className: 'debug-tree' }, '等待首屏 Commit'),
+    createElement(
+      'p',
+      { className: 'hint' },
+      '首次更新会建立 alternate；后续更新复用两格 Fiber，Commit 成功后 root.current 指向刚完成的 WIP。',
+    ),
+  );
+}
+
+/** 页面入口：八张卡片共用同一个 FiberRoot，但各自维护独立 Hook 链表。 */
 function App() {
   return createElement(
     'main',
@@ -453,6 +653,8 @@ function App() {
     createElement(BailoutDemo, null),
     createElement(ContextDemo, null),
     createElement(BoundaryDemo, null),
+    createElement(TimeSliceDemo, null),
+    createElement(DoubleBufferDemo, null),
   );
 }
 
@@ -462,4 +664,7 @@ if (container == null) {
   throw new Error('Root container #root was not found');
 }
 
-createRoot(container).render(createElement(App, null));
+const root = createRoot(container);
+demoRoot = root;
+setupDebugPanel(root);
+root.render(createElement(App, null));

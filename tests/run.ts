@@ -24,9 +24,17 @@ import {
 } from 'scheduler';
 import {
   createContainer,
+  formatDebugFiberTree,
+  inspectFiberRootState,
+  inspectFiberTree,
+  unmountContainer,
   updateContainer,
   type HostConfig,
 } from 'react-reconciler';
+import {
+  configureDebug,
+  type DebugLogEntry,
+} from 'shared';
 import {
   dispatchDelegatedClick,
   hostConfig as domHostConfig,
@@ -301,6 +309,55 @@ test('新列表变短时会删除多余的宿主节点', async () => {
   equal(removed.parent, null, '被删除的节点应断开宿主 parent');
 });
 
+test('两个 root 同一轮 Sync 更新都会提交，不会互相覆盖调度指针', async () => {
+  const first = createTestRoot();
+  const second = createTestRoot();
+
+  updateContainer(createElement('span', null, 'first:0'), first.root);
+  updateContainer(createElement('span', null, 'second:0'), second.root);
+  await flushSyncRender();
+
+  equal(rootText(first.container), 'first:0', '第一个 root 应完成首屏提交');
+  equal(rootText(second.container), 'second:0', '第二个 root 应完成首屏提交');
+
+  updateContainer(createElement('span', null, 'first:1'), first.root);
+  updateContainer(createElement('span', null, 'second:1'), second.root);
+  await flushSyncRender();
+
+  equal(rootText(first.container), 'first:1', '第一个 root 的更新不应丢失');
+  equal(rootText(second.container), 'second:1', '第二个 root 的更新不应丢失');
+});
+
+test('unmountContainer 会清理宿主树、Effect，并阻止旧 Fiber 再更新', async () => {
+  const events: string[] = [];
+  let setValue: ((value: number) => void) | null = null;
+
+  function App() {
+    const [value, set] = useState(0);
+    setValue = set;
+    useEffect(() => {
+      events.push(`create ${value}`);
+      return () => events.push(`destroy ${value}`);
+    }, [value]);
+    return createElement('span', null, String(value));
+  }
+
+  const { container, root } = createTestRoot();
+  updateContainer(createElement(App, null), root);
+  await flushSyncRender();
+  await waitFor(() => events.includes('create 0'), '卸载测试的 Passive Effect 没有执行');
+
+  unmountContainer(root);
+  await flushSyncRender();
+  await waitFor(() => events.includes('destroy 0'), '卸载时 Effect cleanup 没有执行');
+  equal(container.children.length, 0, 'unmount 应移除 root 下的宿主节点');
+
+  const dispatchAfterUnmount = setValue as ((value: number) => void) | null;
+  dispatchAfterUnmount?.(1);
+  await Promise.resolve();
+  equal(container.children.length, 0, '旧 dispatch 不应在卸载后重新挂载子树');
+});
+
 test('同一事件的函数式 setState 会共用一次调度并按入队顺序累加', async () => {
   const { container, root } = createTestRoot();
   const captured: {
@@ -384,6 +441,81 @@ test('Layout 与 Passive Effect 按 Commit 阶段执行，并在依赖变化时�
     'layout destroy 2 | passive destroy 2',
     '教学版删除子树时会在 Mutation 中同步清理两种 Effect',
   );
+});
+
+test('Debug 通道会串起 Hook updateId、Render/Commit 阶段和 Fiber Inspector', async () => {
+  const entries: DebugLogEntry[] = [];
+  configureDebug({
+    level: 'trace',
+    sink: (entry) => entries.push(entry),
+  });
+
+  try {
+    let setValue: (value: number) => void = () => {};
+    function Counter() {
+      const [value, set] = useState(0);
+      setValue = set;
+      return createElement('span', null, String(value));
+    }
+
+    const { container, root } = createTestRoot();
+    updateContainer(createElement(Counter, null), root);
+    await flushSyncRender();
+    const beforeUpdate = inspectFiberRootState(root);
+    setValue(1);
+    await waitFor(() => rootText(container) === '1', 'Debug 测试更新没有提交');
+    const afterUpdate = inspectFiberRootState(root);
+
+    ok(
+      entries.some((entry) => entry.message === 'update enqueued in Hook queue'),
+      'Hook 入队应产生结构化日志',
+    );
+    ok(
+      entries.some((entry) => entry.phase === 'beginWork'),
+      'beginWork 应产生结构化日志',
+    );
+    ok(
+      entries.some((entry) => entry.phase === 'completeWork'),
+      'completeWork 应产生结构化日志',
+    );
+    ok(
+      entries.some((entry) => entry.phase === 'mutation'),
+      'Mutation Commit 应产生结构化日志',
+    );
+    ok(
+      entries.some(
+        (entry) => entry.phase === 'render' && typeof entry.workUnits === 'number',
+      ),
+      '并发 Render 应记录本次切片的 work unit 数量',
+    );
+    equal(
+      afterUpdate.currentRootId,
+      beforeUpdate.currentAlternateId,
+      'Commit 后 current 应切换到更新前的 alternate',
+    );
+    equal(
+      afterUpdate.currentAlternateId,
+      beforeUpdate.currentRootId,
+      'Commit 后 alternate 应指回更新前的 current',
+    );
+
+    const updateIds = new Set(
+      entries
+        .map((entry) => entry.updateId)
+        .filter((updateId): updateId is number => updateId != null),
+    );
+    ok(updateIds.size >= 2, '首屏 render 与 Hook 更新应使用不同 updateId');
+
+    const inspected = inspectFiberTree(root);
+    equal(inspected.tag, 'HostRoot', 'Inspector 根节点应是 HostRoot');
+    equal(inspected.child?.type, 'Counter', 'Inspector 应保留函数组件名称');
+    ok(
+      formatDebugFiberTree(root).includes('FunctionComponent(Counter)'),
+      '格式化 Inspector 应显示函数组件路径',
+    );
+  } finally {
+    configureDebug(null);
+  }
 });
 
 /** react-dom 单元测试使用的最小 HTMLElement 替身。 */
@@ -483,7 +615,20 @@ test('DOM HostConfig 会更新 className、布尔属性和 onXxx 监听器', () 
   equal(clicks, 1, '容器委托只派发一次');
 });
 
-/** 读取根容器下第一个元素的文本，方便断言单节点页面。 */
+test('DOM HostConfig 会删除 style 中已经消失的单个键', () => {
+  const element = new FakeElement();
+  domHostConfig.commitUpdate(
+    element as unknown as HTMLElement,
+    'div',
+    { style: { color: 'red', backgroundColor: 'black' } },
+    { style: { color: 'blue' } },
+  );
+
+  equal(element.style.color, 'blue', '保留的 style 键应更新');
+  equal(element.style.backgroundColor, '', '新 style 缺少的旧键应被清空');
+});
+
+
 function rootText(container: TestContainer): string {
   const first = container.children[0];
   if (first == null || first.kind !== 'element') {

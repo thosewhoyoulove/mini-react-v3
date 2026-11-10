@@ -18,8 +18,8 @@ const listeners = new WeakMap<HTMLElement, Map<string, EventListener>>();
 /** click 处理函数。容器上的唯一监听器按 parentNode 找到它。 */
 const clickHandlers = new WeakMap<object, EventListener>();
 
-/** 已经挂过 click 委托的容器，避免 createRoot 重复 addEventListener。 */
-const delegatedRoots = new WeakSet<object>();
+/** 已经挂过 click 委托的容器，以及对应的容器级监听器。 */
+const delegatedRootListeners = new WeakMap<object, EventListener>();
 
 /** 把 onClick 一类 prop 转成小写原生事件名；普通 prop 返回 null。 */
 function eventNameFromProp(key: string): string | null {
@@ -98,13 +98,24 @@ export function dispatchDelegatedClick(event: Event): void {
 
 /** createRoot 时给容器挂一次 click。节点上的 onClick 只写进 clickHandlers。 */
 export function ensureRootClickDelegation(container: Element): void {
-  if (delegatedRoots.has(container)) {
+  if (delegatedRootListeners.has(container)) {
     return;
   }
-  delegatedRoots.add(container);
-  container.addEventListener('click', (event) => {
+  const listener: EventListener = (event) => {
     dispatchDelegatedClick(event);
-  });
+  };
+  delegatedRootListeners.set(container, listener);
+  container.addEventListener('click', listener);
+}
+
+/** root.unmount 时移除容器级 click 监听，避免根生命周期结束后仍保留委托。 */
+export function removeRootClickDelegation(container: Element): void {
+  const listener = delegatedRootListeners.get(container);
+  if (listener == null) {
+    return;
+  }
+  container.removeEventListener('click', listener);
+  delegatedRootListeners.delete(container);
 }
 
 /**
@@ -168,8 +179,18 @@ function applyProps(
     }
 
     if (key === 'style' && value != null && typeof value === 'object') {
-      Object.assign(domElement.style, value);
-      continue; // 3. 教学版只做浅合并，不做单个旧样式键删除
+      const nextStyle = value as Record<string, unknown>;
+      const prevStyle = prevProps?.style;
+      if (prevStyle != null && typeof prevStyle === 'object') {
+        const style = domElement.style as unknown as Record<string, string>;
+        for (const styleName in prevStyle as Record<string, unknown>) {
+          if (!(styleName in nextStyle)) {
+            style[styleName] = ''; // 旧对象有、新对象没有：清掉单个样式键
+          }
+        }
+      }
+      Object.assign(domElement.style, nextStyle);
+      continue; // 3. 先删除旧键，再合并新样式
     }
 
     if (value == null || value === false) {

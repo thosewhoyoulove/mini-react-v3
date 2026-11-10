@@ -1,5 +1,5 @@
 import { NoFlags } from './fiberFlags';
-import { NoLanes } from './fiberLanes';
+import { NoLanes, type Lanes } from './fiberLanes';
 import {
   REACT_FORWARD_REF_TYPE,
   REACT_FRAGMENT_TYPE,
@@ -162,6 +162,33 @@ export interface Fiber {
  * 所以从任意 Fiber 一直 return 上去，就能找到 root。
  */
 export interface FiberRoot {
+  /** 当前 root 在 Render 阶段停住的下一个工作单元。不同 root 各自保存，切片交错时不会互相覆盖。 */
+  workInProgress: Fiber | null;
+
+  /** 当前 root 本轮 Render 正在处理的 lanes。 */
+  workInProgressRootRenderLanes: Lanes;
+
+  /** 当前 root 是否需要丢弃半成品 WIP，从根重新计算。 */
+  rootNeedsRestart: boolean;
+
+  /** 当前 root 已经提交、等待执行的 Passive Effect 树。 */
+  pendingPassiveEffects: Fiber | null;
+
+  /** 等待执行的 Passive 树对应的 Commit updateId，避免被后续更新覆盖。 */
+  pendingPassiveEffectsUpdateId: number | null;
+
+  /** 当前 root 是否已经预约了 Passive Effect flush。 */
+  passiveEffectsScheduled: boolean;
+
+  /** root.unmount 已经请求后，拒绝旧 Fiber 上继续发起的更新。 */
+  isUnmounted: boolean;
+
+  /** 最近一次进入调度器的更新编号，供 Render / Commit 日志串联。 */
+  debugUpdateId: number | null;
+
+  /** 当前并发切片已经执行的工作单元数，供时间切片 Demo 展示。 */
+  debugWorkUnits: number;
+
   /** 真实 DOM 容器，一般是 #root */
   containerInfo: any;
   /** 屏幕上那棵树的 HostRoot */

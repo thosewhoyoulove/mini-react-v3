@@ -5,6 +5,11 @@ import {
   unstable_scheduleCallback,
   unstable_shouldYield,
 } from 'scheduler';
+import {
+  createDebugUpdateId,
+  debugLog,
+  enableSchedulerDebugging,
+} from 'shared';
 import { beginWork, isErrorBoundaryFiber, popProvidersAbove } from './beginWork';
 import { commitRoot } from './commitWork';
 import { completeWork } from './completeWork';
@@ -54,27 +59,11 @@ import { setScheduleUpdateOnFiber } from './scheduleUpdate';
  * 高优进来时 cancel 掉已约的低优回调，丢掉半成品 WIP 从根重来。
  */
 
-/** 当前正在处理的 Fiber。时间切片暂停时它停在「下一个该处理的节点」。 */
-let workInProgress: Fiber | null = null;
-/** 正在 render 的那棵树的根。新更新用它判断「是不是打断正在做的这一轮」。 */
-let workInProgressRoot: FiberRoot | null = null;
-/** 本轮 render 正在处理的 lanes。新更新拿它比较：更高优 / 同档 → 从根重启。 */
-let workInProgressRootRenderLanes: Lanes = NoLanes;
+/** 同步更新待处理的 root 集合；同一事件中的多个 root 各自保留一次工作。 */
+const syncRoots = new Set<FiberRoot>();
 
-/** 教学实现：单根。setState 时顺着 return 找不到 HostRoot 就退回这里。 */
-let currentRoot: FiberRoot | null = null;
-
-/**
- * 切片暂停后（或本轮 render 尚未 commit）又来了同档或更高优更新。
- * 半成品 WIP 上已经 beginWork 过的节点看不到新的 hook 队列，必须丢弃从根重来。
- * 更低优的更新只记在 pendingLanes 里，等本轮 commit 后再 schedule。
- */
-let rootNeedsRestart = false;
-
-/** 同一事件里多次 Sync 更新只约一次微任务。 */
+/** 同一轮事件里多次 Sync 更新只约一次微任务。 */
 let syncScheduled = false;
-/** 那个微任务真正要处理的 root。后到的 Sync 只改这个指针，不另约。 */
-let syncRoot: FiberRoot | null = null;
 
 /**
  * 顺着 return 找到 HostRoot，再取 stateNode 上的 FiberRoot。
@@ -88,10 +77,29 @@ function getFiberRoot(fiber: Fiber): FiberRoot {
   if (node.tag === HostRoot && node.stateNode != null) {
     return node.stateNode as FiberRoot;
   }
-  if (currentRoot == null) {
-    throw new Error('Cannot find FiberRoot');
+  throw new Error('Cannot find FiberRoot');
+}
+
+/** 计算 Fiber 在 return 链上的深度，日志用它把不同组件的工作缩进对齐。 */
+function getFiberDepth(fiber: Fiber): number {
+  let depth = 0;
+  let parent = fiber.return;
+  while (parent != null) {
+    depth += 1;
+    parent = parent.return;
   }
-  return currentRoot;
+  return depth;
+}
+
+/** 只读取 Fiber 身份，不执行组件函数，供结构化日志显示。 */
+function getDebugComponent(fiber: Fiber): string | null {
+  if (typeof fiber.type === 'string') {
+    return fiber.type;
+  }
+  if (typeof fiber.type === 'function') {
+    return fiber.type.name || 'Anonymous';
+  }
+  return null;
 }
 
 /**
@@ -151,7 +159,11 @@ function isThenable(value: unknown): value is PromiseLike<unknown> & object {
  * 3. 记下原 lane，thenable 完成后再用这一档重试
  * 4. 找不到边界就把错误继续抛出
  */
-function unwindWork(source: Fiber, error: unknown): void {
+function unwindWork(
+  source: Fiber,
+  error: unknown,
+  root: FiberRoot,
+): void {
   const suspended = isThenable(error);
   let node = source.return;
   while (node != null) {
@@ -164,7 +176,7 @@ function unwindWork(source: Fiber, error: unknown): void {
       popProvidersAbove(node);
       const thenable = error;
       const boundary = node;
-      const lane = getHighestPriorityLane(workInProgressRootRenderLanes);
+      const lane = getHighestPriorityLane(root.workInProgressRootRenderLanes);
       if (!scheduledThenables.has(thenable)) {
         scheduledThenables.add(thenable);
         thenable.then(() => {
@@ -174,7 +186,7 @@ function unwindWork(source: Fiber, error: unknown): void {
           ); // 3
         });
       }
-      workInProgress = node;
+      root.workInProgress = node;
       return;
     }
     if (
@@ -185,7 +197,7 @@ function unwindWork(source: Fiber, error: unknown): void {
       node.flags |= DidCapture; // 2
       node.updateQueue = { error };
       popProvidersAbove(node);
-      workInProgress = node;
+      root.workInProgress = node;
       return;
     }
     node = node.return;
@@ -193,20 +205,38 @@ function unwindWork(source: Fiber, error: unknown): void {
   throw error; // 4
 }
 
-function performUnitOfWork(unitOfWork: Fiber): void {
+function performUnitOfWork(unitOfWork: Fiber, root: FiberRoot): void {
+  root.debugWorkUnits += 1; // 每个 Fiber 只算一个工作单元，时间切片在这里累计
   const current = unitOfWork.alternate;
   try {
-    const next = beginWork(current, unitOfWork, workInProgressRootRenderLanes);
+    debugLog('trace', {
+      phase: 'beginWork',
+      message: 'beginWork start',
+      component: getDebugComponent(unitOfWork),
+      fiberTag: String(unitOfWork.tag),
+      lane: root.workInProgressRootRenderLanes,
+      flags: unitOfWork.flags,
+      depth: getFiberDepth(unitOfWork),
+      updateId: root.debugUpdateId,
+    });
+    const next = beginWork(
+      current,
+      unitOfWork,
+      root.workInProgressRootRenderLanes,
+    );
     unitOfWork.memoizedProps = unitOfWork.pendingProps;
-    unitOfWork.lanes = removeLanes(unitOfWork.lanes, workInProgressRootRenderLanes);
+    unitOfWork.lanes = removeLanes(
+      unitOfWork.lanes,
+      root.workInProgressRootRenderLanes,
+    );
     // 本轮 renderLanes 对应的更新已在这个节点上处理完，清掉以免下一轮重复
     if (next == null) {
-      completeUnitOfWork(unitOfWork);
+      completeUnitOfWork(unitOfWork, root);
     } else {
-      workInProgress = next;
+      root.workInProgress = next;
     }
   } catch (error) {
-    unwindWork(unitOfWork, error);
+    unwindWork(unitOfWork, error, root);
   }
 }
 
@@ -219,34 +249,44 @@ function performUnitOfWork(unitOfWork: Fiber): void {
  *
  * 一直升到 HostRoot，workInProgress 变成 null，表示 Render 结束。
  */
-function completeUnitOfWork(unitOfWork: Fiber): void {
+function completeUnitOfWork(unitOfWork: Fiber, root: FiberRoot): void {
   let completedWork: Fiber | null = unitOfWork;
   do {
+    debugLog('trace', {
+      phase: 'completeWork',
+      message: 'completeWork',
+      component: getDebugComponent(completedWork),
+      fiberTag: String(completedWork.tag),
+      lane: root.workInProgressRootRenderLanes,
+      flags: completedWork.flags,
+      depth: getFiberDepth(completedWork),
+      updateId: root.debugUpdateId,
+    });
     completeWork(completedWork.alternate, completedWork);
     const siblingFiber = completedWork.sibling;
     if (siblingFiber != null) {
-      workInProgress = siblingFiber; // 先走完这一层，父节点还没 complete
+      root.workInProgress = siblingFiber; // 先走完这一层，父节点还没 complete
       return;
     }
     completedWork = completedWork.return;
-    workInProgress = completedWork;
+    root.workInProgress = completedWork;
   } while (completedWork != null);
 }
 
-/** SyncLane：不问 shouldYield，一个微任务里把树走完。 */
-function workLoopSync(): void {
-  while (workInProgress != null) {
-    performUnitOfWork(workInProgress);
+/** SyncLane：不问 shouldYield，一个微任务里把这个 root 的树走完。 */
+function workLoopSync(root: FiberRoot): void {
+  while (root.workInProgress != null) {
+    performUnitOfWork(root.workInProgress, root);
   }
 }
 
 /**
  * DefaultLane：每处理完一个 Fiber 问一次 shouldYield。
- * 5ms 到了就退出，workInProgress 停在下一个节点，下一宏任务接着走。
+ * 5ms 到了就退出，root.workInProgress 停在下一个节点，下一宏任务接着走。
  */
-function workLoopConcurrent(): void {
-  while (workInProgress != null && !unstable_shouldYield()) {
-    performUnitOfWork(workInProgress);
+function workLoopConcurrent(root: FiberRoot): void {
+  while (root.workInProgress != null && !unstable_shouldYield()) {
+    performUnitOfWork(root.workInProgress, root);
   }
 }
 
@@ -256,11 +296,11 @@ function workLoopConcurrent(): void {
  */
 function prepareFreshStack(root: FiberRoot): void {
   const current = root.current;
-  workInProgress = createWorkInProgress(
+  root.workInProgress = createWorkInProgress(
     current,
     current.pendingProps ?? current.memoizedProps,
   );
-  workInProgress.stateNode = root;
+  root.workInProgress.stateNode = root;
 }
 
 /**
@@ -284,9 +324,19 @@ function finishRoot(root: FiberRoot, renderedLanes: Lanes): void {
   }
   root.finishedWork = finishedWork;
   markRootFinished(root, renderedLanes);
+  debugLog('info', {
+    phase: 'commit',
+    message: 'render completed; commit starts',
+    component: 'HostRoot',
+    fiberTag: 'HostRoot',
+    lane: renderedLanes,
+    flags: finishedWork.flags,
+    depth: 0,
+    updateId: root.debugUpdateId,
+  });
   commitRoot(root);
-  workInProgressRoot = null;
-  workInProgressRootRenderLanes = NoLanes;
+  root.workInProgress = null;
+  root.workInProgressRootRenderLanes = NoLanes;
   ensureRootIsScheduled(root); // pending 里若还留着 Default，commit 后再约
 }
 
@@ -303,15 +353,14 @@ function performSyncWorkOnRoot(root: FiberRoot): void {
     return;
   }
 
-  workInProgressRoot = root;
-  workInProgressRootRenderLanes = SyncLane;
-  rootNeedsRestart = false;
-  workInProgress = null; // Sync 不能接着 Default 的半成品 WIP
+  root.workInProgressRootRenderLanes = SyncLane;
+  root.rootNeedsRestart = false;
+  root.workInProgress = null; // Sync 不能接着 Default 的半成品 WIP
   prepareFreshStack(root);
-  workLoopSync();
+  workLoopSync(root);
 
-  if (rootNeedsRestart) {
-    workInProgress = null;
+  if (root.rootNeedsRestart) {
+    root.workInProgress = null;
     ensureRootIsScheduled(root);
     return;
   }
@@ -336,49 +385,61 @@ function performConcurrentWorkOnRoot(root: FiberRoot): void {
     return;
   }
 
-  workInProgressRoot = root;
-
-  if (rootNeedsRestart) {
-    workInProgress = null; // 同档/更高优插队：半成品上看不到新 hook 队列
-    rootNeedsRestart = false;
+  if (root.rootNeedsRestart) {
+    root.workInProgress = null; // 同档/更高优插队：半成品上看不到新 hook 队列
+    root.rootNeedsRestart = false;
   }
 
-  if (workInProgress == null) {
-    workInProgressRootRenderLanes = lanes;
+  if (root.workInProgress == null) {
+    root.workInProgressRootRenderLanes = lanes;
     prepareFreshStack(root); // 第一拍或刚 restart：从根建新 WIP；否则接着上一拍的断点
   }
 
-  workLoopConcurrent();
+  root.debugWorkUnits = 0; // 每个 Scheduler 回调重新统计本次切片
+  workLoopConcurrent(root);
+  const didYield = root.workInProgress != null;
+  debugLog('info', {
+    phase: 'render',
+    message: didYield ? 'concurrent slice yielded' : 'concurrent render completed',
+    component: 'HostRoot',
+    fiberTag: 'HostRoot',
+    lane: root.workInProgressRootRenderLanes,
+    flags: null,
+    depth: 0,
+    updateId: root.debugUpdateId,
+    workUnits: root.debugWorkUnits,
+    didYield,
+  });
 
-  if (rootNeedsRestart) {
-    workInProgress = null;
+  if (root.rootNeedsRestart) {
+    root.workInProgress = null;
     ensureRootIsScheduled(root);
     return;
   }
 
-  if (workInProgress != null) {
+  if (root.workInProgress != null) {
     ensureRootIsScheduled(root); // 时间到了、树没走完：约下一拍从断点继续
     return;
   }
 
-  finishRoot(root, workInProgressRootRenderLanes);
+  finishRoot(root, root.workInProgressRootRenderLanes);
 }
 
 /**
- * 把 Sync 工作排进微任务。同一轮事件里多次 root.render / Sync 更新只约一次：
- * 只更新 syncRoot，等当前栈走完、微任务执行时一次性处理。
+ * 把 Sync 工作排进微任务。
+ * 同一轮事件里多次 root.render / Sync 更新只约一次微任务，但集合会保留每个 root。
  */
 function scheduleSyncCallback(root: FiberRoot): void {
-  syncRoot = root;
+  syncRoots.add(root);
   if (syncScheduled) {
-    return; // 已经约过微任务，只更新 syncRoot
+    return; // 已经约过微任务，只把这个 root 加入待处理集合
   }
   syncScheduled = true;
   queueMicrotask(() => {
     syncScheduled = false;
-    const nextRoot = syncRoot;
-    syncRoot = null;
-    if (nextRoot != null) {
+    const nextRoots = Array.from(syncRoots);
+    syncRoots.clear();
+    for (const nextRoot of nextRoots) {
       performSyncWorkOnRoot(nextRoot);
     }
   });
@@ -433,10 +494,13 @@ function ensureRootIsScheduled(root: FiberRoot): void {
   root.callbackPriority = newCallbackPriority;
   const schedulerPriority =
     newCallbackPriority === TransitionLane ? LowPriority : NormalPriority;
-  root.callbackNode = unstable_scheduleCallback(schedulerPriority, () => {
+  const callbackNode = unstable_scheduleCallback(schedulerPriority, () => {
     performConcurrentWorkOnRoot(root);
   });
-  // DefaultLane：宏任务里可切片。task id 记在 callbackNode，方便被 Sync cancel
+  if (!enableSchedulerDebugging) {
+    root.callbackNode = callbackNode;
+  }
+  // Debugging 模式同步执行 callback，不保留一个已经执行完的伪 task id。
 }
 
 /**
@@ -445,10 +509,12 @@ function ensureRootIsScheduled(root: FiberRoot): void {
  * 更低优只记在 pendingLanes，本轮 commit 完再处理。
  */
 function shouldRestartCurrentRender(root: FiberRoot, updateLane: Lane): boolean {
-  if (workInProgress == null || workInProgressRoot !== root) {
+  if (root.workInProgress == null) {
     return false;
   }
-  const renderPriority = getHighestPriorityLane(workInProgressRootRenderLanes);
+  const renderPriority = getHighestPriorityLane(
+    root.workInProgressRootRenderLanes,
+  );
   const updatePriority = getHighestPriorityLane(updateLane);
   if (updatePriority === renderPriority) {
     return true;
@@ -460,11 +526,29 @@ function shouldRestartCurrentRender(root: FiberRoot, updateLane: Lane): boolean 
  * hooks 里 setState / updateContainer 最终走到这里。
  * 只做三件事：沿途标 lane、合并进 root.pendingLanes、决定要不要重启并约一次工作。
  */
-export function scheduleUpdateOnFiberImpl(fiber: Fiber, lane: Lane): void {
+export function scheduleUpdateOnFiberImpl(
+  fiber: Fiber,
+  lane: Lane,
+  updateId: number = createDebugUpdateId(),
+): void {
   const root = markUpdateLaneFromFiberToRoot(fiber, lane);
+  if (root.isUnmounted) {
+    return;
+  }
+  root.debugUpdateId = updateId;
+  debugLog('info', {
+    phase: 'scheduleUpdate',
+    message: 'schedule update on Fiber',
+    component: getDebugComponent(fiber),
+    fiberTag: String(fiber.tag),
+    lane,
+    flags: fiber.flags,
+    depth: getFiberDepth(fiber),
+    updateId,
+  });
   root.pendingLanes = mergeLanes(root.pendingLanes, lane);
   if (shouldRestartCurrentRender(root, lane)) {
-    rootNeedsRestart = true;
+    root.rootNeedsRestart = true;
   }
   ensureRootIsScheduled(root);
 }
@@ -485,17 +569,44 @@ export function createContainer(
     pendingLanes: NoLanes,
     callbackNode: null,
     callbackPriority: NoLane,
+    workInProgress: null,
+    workInProgressRootRenderLanes: NoLanes,
+    rootNeedsRestart: false,
+    pendingPassiveEffects: null,
+    pendingPassiveEffectsUpdateId: null,
+    passiveEffectsScheduled: false,
+    isUnmounted: false,
+    debugUpdateId: null,
+    debugWorkUnits: 0,
   };
   uninitializedFiber.stateNode = root; // HostRoot ↔ FiberRoot 互相指
-  currentRoot = root;
   setHostConfig(hostConfig);
   return root;
 }
 
 /** root.render(element)：挂到 HostRoot.pendingProps，用 SyncLane 保证首屏马上画。 */
 export function updateContainer(element: unknown, container: FiberRoot): void {
+  if (container.isUnmounted) {
+    throw new Error('Cannot update an unmounted root');
+  }
   container.current.pendingProps = { children: element };
   scheduleUpdateOnFiberImpl(container.current, SyncLane);
+}
+
+/**
+ * root.unmount 使用的入口。
+ *
+ * 1. 先把 HostRoot 的 children 置空，沿正常删除路径清理 DOM、ref 和 effect
+ * 2. 用 SyncLane 保证卸载在下一次微任务完成
+ * 3. 标记 root，阻止旧 Fiber 上保存的 setState 再次调度工作
+ */
+export function unmountContainer(container: FiberRoot): void {
+  if (container.isUnmounted) {
+    return;
+  }
+  container.current.pendingProps = { children: null };
+  scheduleUpdateOnFiberImpl(container.current, SyncLane);
+  container.isUnmounted = true;
 }
 
 export { DefaultLane, SyncLane };
